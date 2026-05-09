@@ -13,6 +13,27 @@ chmod +x run.sh smoke.sh
 python3 -m pip install --user pytest
 ```
 
+## Default flow (interactive)
+
+```sh
+fanout "audit auth for security"
+```
+
+This triggers, in order:
+1. **Intent Q&A**: a small LLM agent reads your command, prints 2-3 clarifying questions, you answer, the agent refines `command` / `mode` / `n` / `files` / `refs`.
+2. **Planner**: produces the JSON plan.
+3. **Plan gate**: shows the plan and prompts `[a]ccept / [e]dit / [r]egen / [q]uit`.  `e` opens `$EDITOR` on the plan JSON; `r` re-runs the planner.
+4. **tmux dispatch**: spawns N visible panes in a detached tmux session. Each pane runs `claude -p` for one worker, writes output to `/tmp/fanout_<id>/W<n>.out`, touches a `.done` sentinel. Orchestrator polls.
+5. **Reducer**: synthesises results per `merge_plan`.
+
+Attach the tmux session in another terminal to watch workers live:
+
+```sh
+tmux attach -t fanout_<id>
+```
+
+(The orchestrator prints the exact attach command.)
+
 ## Quickstart
 
 Three modes; pick whichever fits the work.
@@ -67,6 +88,10 @@ Three modes; pick whichever fits the work.
 | `--out-plan <path>` | Write the validated plan to disk. |
 | `--no-reducer` | Print raw worker outputs instead of synthesising. |
 | `--timeout <sec>` | Per-call timeout (default 600s). |
+| `--auto` | Skip intent Q&A and plan gate. For scripted use. |
+| `--no-intent` | Skip the intent Q&A only; plan gate still shown. |
+| `--no-tmux` | Force headless `asyncio.gather` dispatch. |
+| `--keep-tmux` | Don't kill the tmux session after workers finish — useful for inspection. |
 
 ## Exit codes
 

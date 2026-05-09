@@ -13,12 +13,22 @@ import time
 from typing import Any, List, Optional
 
 from context import build_bundle
-from prompts import PLANNER_SYSTEM, REDUCER_SYSTEM, planner_schema
+from prompts import (
+    INTENT_QUESTIONS_SYSTEM,
+    INTENT_REFINE_SYSTEM,
+    PLANNER_SYSTEM,
+    REDUCER_SYSTEM,
+    planner_schema,
+)
 from workers import (
     BackendError,
     BackendTimeout,
     call_claude,
+    dispatch_tmux,
+    kill_tmux_session,
     parse_claude_envelope,
+    tmux_available,
+    wait_for_done,
 )
 
 VALID_MODES = ("scratch", "extend", "greenfield")
@@ -279,6 +289,166 @@ def _check_self_contained(plan: dict) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Intent loop (interactive Q&A pre-planner)
+# ---------------------------------------------------------------------------
+
+
+async def intent_questions(command: str, hints: dict, *, timeout: float = 120.0) -> dict:
+    """Ask the intent-questions agent for 2-3 clarifying questions."""
+    payload = json.dumps({"command": command, "hints": hints}, indent=2)
+    raw = await call_claude(payload, system=INTENT_QUESTIONS_SYSTEM, timeout=timeout)
+    inner = parse_claude_envelope(raw)
+    obj = extract_json(inner)
+    if not isinstance(obj, dict) or "questions" not in obj:
+        raise PlanParseError(f"intent agent returned bad shape: {obj!r}")
+    return obj
+
+
+async def intent_refine(
+    command: str,
+    questions: list,
+    answers: list,
+    *,
+    timeout: float = 120.0,
+) -> dict:
+    """Send Q+A back to the refiner; get tightened {command, mode, n, files, refs}."""
+    payload = json.dumps(
+        {"command": command, "questions": questions, "answers": answers}, indent=2
+    )
+    raw = await call_claude(payload, system=INTENT_REFINE_SYSTEM, timeout=timeout)
+    inner = parse_claude_envelope(raw)
+    obj = extract_json(inner)
+    required = {"command", "mode", "n", "files", "refs"}
+    if not isinstance(obj, dict) or not required.issubset(obj):
+        raise PlanParseError(f"intent refiner returned bad shape: {list(obj) if isinstance(obj, dict) else obj}")
+    return obj
+
+
+def _read_multiline_answer(prompt: str) -> str:
+    """Read a single-line answer (or multi-line if user enters \\ at end)."""
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    line = sys.stdin.readline()
+    return line.rstrip("\n")
+
+
+async def run_intent_loop(args: argparse.Namespace) -> argparse.Namespace:
+    """Drive the pre-planner Q&A. Returns args mutated with refined fields."""
+    print("\n[intent] thinking about your command...", file=sys.stderr)
+    hints = {
+        "mode_hint": args.mode,
+        "n_hint": args.n,
+        "has_repo": bool(args.repo),
+        "has_files": bool(args.files),
+        "has_refs": bool(args.refs),
+    }
+    try:
+        q_obj = await intent_questions(args.command, hints, timeout=args.timeout)
+    except (PlanParseError, BackendError, BackendTimeout) as e:
+        print(f"[intent] agent failed ({e}); skipping intent loop", file=sys.stderr)
+        return args
+
+    qs = q_obj.get("questions", [])
+    guess = q_obj.get("guess", {})
+    if guess:
+        print(
+            f"[intent] guess: mode={guess.get('mode')!r} n={guess.get('n')} — "
+            f"{guess.get('rationale', '')}",
+            file=sys.stderr,
+        )
+
+    answers = []
+    print("\n--- intent Q&A — press enter to accept default ---\n")
+    for q in qs:
+        print(f"Q{q.get('id', '?')}: {q.get('text', '')}")
+        if q.get("why"):
+            print(f"   ({q['why']})")
+        a = _read_multiline_answer("> ")
+        answers.append({"id": q.get("id"), "text": q.get("text"), "answer": a})
+    print()
+
+    print("[intent] refining...", file=sys.stderr)
+    try:
+        refined = await intent_refine(args.command, qs, answers, timeout=args.timeout)
+    except (PlanParseError, BackendError, BackendTimeout) as e:
+        print(f"[intent] refiner failed ({e}); using original args", file=sys.stderr)
+        return args
+
+    print(f"\n[intent] refined: {refined.get('summary', '(no summary)')}", file=sys.stderr)
+    print(
+        f"[intent]   command={refined['command']!r}",
+        file=sys.stderr,
+    )
+    print(
+        f"[intent]   mode={refined['mode']} n={refined['n']} "
+        f"files={refined['files']} refs={refined['refs']}",
+        file=sys.stderr,
+    )
+
+    # User can override CLI defaults with refined values, but explicit CLI flags win.
+    args.command = refined["command"]
+    if refined["mode"] in VALID_MODES and not _flag_was_explicit("--mode"):
+        args.mode = refined["mode"]
+    if refined["n"] in VALID_N and not _flag_was_explicit("-n"):
+        args.n = refined["n"]
+    if refined["files"] and not args.files:
+        args.files = list(refined["files"])
+    if refined["refs"] and not args.refs:
+        args.refs = list(refined["refs"])
+    return args
+
+
+def _flag_was_explicit(flag: str) -> bool:
+    """Crude check: was this flag passed on the command line?"""
+    return any(a == flag or a.startswith(flag + "=") for a in sys.argv[1:])
+
+
+# ---------------------------------------------------------------------------
+# Plan approval gate (interactive)
+# ---------------------------------------------------------------------------
+
+
+def plan_gate(p: dict) -> str:
+    """Show plan, prompt user for accept/edit/regen/quit. Returns one of those four words."""
+    import os
+    import subprocess as _sp
+    import tempfile
+
+    print("\n=== PROPOSED PLAN ===\n", file=sys.stderr)
+    print(json.dumps(p, indent=2))
+    print("\n", file=sys.stderr)
+
+    while True:
+        sys.stdout.write("[plan] [a]ccept / [e]dit / [r]egen / [q]uit > ")
+        sys.stdout.flush()
+        choice = sys.stdin.readline().strip().lower()
+        if choice in ("a", "accept", ""):
+            return "accept"
+        if choice in ("q", "quit", "abort"):
+            return "quit"
+        if choice in ("r", "regen", "regenerate"):
+            return "regen"
+        if choice in ("e", "edit"):
+            editor = os.environ.get("EDITOR", "vi")
+            with tempfile.NamedTemporaryFile(
+                "w+", suffix=".json", delete=False
+            ) as tf:
+                tf.write(json.dumps(p, indent=2))
+                path = tf.name
+            try:
+                _sp.run([editor, path], check=False)
+                with open(path) as f:
+                    edited = json.load(f)
+                p.clear()
+                p.update(edited)
+                return "edited"
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"[plan] edit failed: {e}", file=sys.stderr)
+                continue
+        print("(unrecognized; try a / e / r / q)", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -331,6 +501,86 @@ async def reduce_(command: str, plan_dict: dict, results: List[dict]) -> str:
     return await call_claude(payload, system=REDUCER_SYSTEM)
 
 
+def _build_worker_prompt(sub: dict, bundle: dict) -> str:
+    needed = [f for f in bundle.get("files", []) if f["path"] in sub.get("read_files", [])]
+    worker_ctx = {"files": needed, "refs": sub.get("refs", [])}
+    return json.dumps({"task": sub, "context": worker_ctx}, indent=2)
+
+
+async def _dispatch_headless(args, p, bundle):
+    print(f"[fanout] dispatching {len(p['subtasks'])} workers (headless)...", file=sys.stderr)
+    coros = [run_worker(s, bundle, args.repo, timeout=args.timeout) for s in p["subtasks"]]
+    raw_results = await asyncio.gather(*coros, return_exceptions=True)
+    results: List[dict] = []
+    failed = 0
+    for sub, r in zip(p["subtasks"], raw_results):
+        if isinstance(r, Exception):
+            failed += 1
+            results.append(
+                {
+                    "id": sub["id"],
+                    "title": sub["title"],
+                    "output": f"[ERROR] {type(r).__name__}: {r}",
+                    "error": True,
+                }
+            )
+        else:
+            results.append(r)
+    return results, failed
+
+
+async def _dispatch_tmux(args, p, bundle):
+    print(f"[fanout] dispatching {len(p['subtasks'])} workers (tmux)...", file=sys.stderr)
+    prompts = [_build_worker_prompt(s, bundle) for s in p["subtasks"]]
+    info = dispatch_tmux(prompts, cwd=args.repo)
+    session = info["session"]
+    print(f"[fanout] tmux session: {session}", file=sys.stderr)
+    print(f"[fanout]   attach: tmux attach -t {session}", file=sys.stderr)
+    print(f"[fanout]   logs:   {info['run_dir']}/W*.out", file=sys.stderr)
+
+    raw_results = await wait_for_done(
+        info["pane_files"],
+        poll_interval=2.0,
+        timeout=args.timeout * 2,
+    )
+
+    by_id = {r["id"]: r for r in raw_results}
+    results: List[dict] = []
+    failed = 0
+    for sub in p["subtasks"]:
+        r = by_id.get(sub["id"], {})
+        if r.get("error") or not r.get("output"):
+            failed += 1
+            results.append(
+                {
+                    "id": sub["id"],
+                    "title": sub["title"],
+                    "output": r.get("output") or "[ERROR] no output captured",
+                    "error": True,
+                }
+            )
+        else:
+            results.append(
+                {
+                    "id": sub["id"],
+                    "title": sub["title"],
+                    "output": r["output"],
+                    "error": False,
+                }
+            )
+
+    if not args.keep_tmux:
+        kill_tmux_session(session)
+        print(f"[fanout] killed tmux session {session}", file=sys.stderr)
+    else:
+        print(
+            f"[fanout] keeping tmux session {session} (--keep-tmux). "
+            f"Kill with: tmux kill-session -t {session}",
+            file=sys.stderr,
+        )
+    return results, failed
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -356,6 +606,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Print raw worker outputs instead of running the reducer.",
     )
     ap.add_argument("--timeout", type=float, default=600.0, help="Per-call timeout (seconds).")
+    ap.add_argument(
+        "--auto",
+        action="store_true",
+        help="Skip the intent Q&A and the plan-approval gate. For scripted use.",
+    )
+    ap.add_argument(
+        "--no-intent",
+        action="store_true",
+        help="Skip the intent Q&A only (plan gate still shown unless --auto).",
+    )
+    ap.add_argument(
+        "--no-tmux",
+        action="store_true",
+        help="Force headless asyncio.gather dispatch, even when tmux is available.",
+    )
+    ap.add_argument(
+        "--keep-tmux",
+        action="store_true",
+        help="Don't kill the tmux session after workers complete. Useful for inspection.",
+    )
     return ap.parse_args(argv)
 
 
@@ -378,6 +648,13 @@ def _print_plan_summary(p: dict, file=sys.stderr) -> None:
 
 
 async def _main(args: argparse.Namespace) -> int:
+    if not args.auto and not args.no_intent and not args.plan_path:
+        try:
+            args = await run_intent_loop(args)
+        except KeyboardInterrupt:
+            print("\n[fanout] aborted in intent loop", file=sys.stderr)
+            return 130
+
     err = _validate_args(args)
     if err:
         print(f"[fanout] error: {err}", file=sys.stderr)
@@ -413,25 +690,44 @@ async def _main(args: argparse.Namespace) -> int:
                 print(f"  - {line}", file=sys.stderr)
             return 2
     else:
-        print("[fanout] calling planner...", file=sys.stderr)
-        t0 = time.monotonic()
-        try:
-            p = await plan(args.command, args.n, args.mode, bundle, timeout=args.timeout)
-        except PlanParseError as e:
-            print(f"[fanout] planner output unparseable: {e}", file=sys.stderr)
-            return 3
-        except PlanValidationError as e:
-            print("[fanout] plan validation failed:", file=sys.stderr)
-            for line in e.errors:
-                print(f"  - {line}", file=sys.stderr)
-            return 2
-        except (BackendError, BackendTimeout) as e:
-            print(f"[fanout] backend error: {e}", file=sys.stderr)
-            return 3
-        print(
-            f"[fanout] planner returned in {time.monotonic() - t0:.1f}s",
-            file=sys.stderr,
-        )
+        while True:
+            print("[fanout] calling planner...", file=sys.stderr)
+            t0 = time.monotonic()
+            try:
+                p = await plan(args.command, args.n, args.mode, bundle, timeout=args.timeout)
+            except PlanParseError as e:
+                print(f"[fanout] planner output unparseable: {e}", file=sys.stderr)
+                return 3
+            except PlanValidationError as e:
+                print("[fanout] plan validation failed:", file=sys.stderr)
+                for line in e.errors:
+                    print(f"  - {line}", file=sys.stderr)
+                return 2
+            except (BackendError, BackendTimeout) as e:
+                print(f"[fanout] backend error: {e}", file=sys.stderr)
+                return 3
+            print(
+                f"[fanout] planner returned in {time.monotonic() - t0:.1f}s",
+                file=sys.stderr,
+            )
+            if args.auto or args.dry_run:
+                break
+            choice = plan_gate(p)
+            if choice in ("accept", "edited"):
+                if choice == "edited":
+                    try:
+                        validate_plan(p, args.command, args.n, args.mode, bundle)
+                    except PlanValidationError as e:
+                        print("[fanout] edited plan failed validation:", file=sys.stderr)
+                        for line in e.errors:
+                            print(f"  - {line}", file=sys.stderr)
+                        return 2
+                break
+            if choice == "regen":
+                continue
+            if choice == "quit":
+                print("[fanout] aborted at plan gate", file=sys.stderr)
+                return 0
 
     print("[fanout] validating plan... OK", file=sys.stderr)
     _print_plan_summary(p)
@@ -445,25 +741,11 @@ async def _main(args: argparse.Namespace) -> int:
         print(json.dumps(p, indent=2))
         return 0
 
-    print(f"[fanout] dispatching {len(p['subtasks'])} workers...", file=sys.stderr)
-    coros = [run_worker(s, bundle, args.repo, timeout=args.timeout) for s in p["subtasks"]]
-    raw_results = await asyncio.gather(*coros, return_exceptions=True)
-
-    results: List[dict] = []
-    failed = 0
-    for sub, r in zip(p["subtasks"], raw_results):
-        if isinstance(r, Exception):
-            failed += 1
-            results.append(
-                {
-                    "id": sub["id"],
-                    "title": sub["title"],
-                    "output": f"[ERROR] {type(r).__name__}: {r}",
-                    "error": True,
-                }
-            )
-        else:
-            results.append(r)
+    use_tmux = (not args.no_tmux) and tmux_available()
+    if use_tmux:
+        results, failed = await _dispatch_tmux(args, p, bundle)
+    else:
+        results, failed = await _dispatch_headless(args, p, bundle)
     print(
         f"[fanout] {len(results) - failed} ok, {failed} failed",
         file=sys.stderr,
