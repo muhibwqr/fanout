@@ -1,0 +1,24 @@
+{
+  "n": 2,
+  "mode": "greenfield",
+  "strategy": "by_hypothesis",
+  "subtasks": [
+    {
+      "id": 1,
+      "title": "approach a",
+      "instructions": "explore",
+      "read_files": ["src/auth/middleware.py"],
+      "refs": [],
+      "expected_output": "md"
+    },
+    {
+      "id": 2,
+      "title": "approach b",
+      "instructions": "explore",
+      "read_files": [],
+      "refs": [],
+      "expected_output": "md"
+    }
+  ],
+  "merge_plan": "rank"
+}

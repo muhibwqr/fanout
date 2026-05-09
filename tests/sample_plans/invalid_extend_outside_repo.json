@@ -1,0 +1,24 @@
+{
+  "n": 2,
+  "mode": "extend",
+  "strategy": "by_file",
+  "subtasks": [
+    {
+      "id": 1,
+      "title": "w1",
+      "instructions": "review",
+      "read_files": ["src/auth/oauth.py"],
+      "refs": [],
+      "expected_output": "md"
+    },
+    {
+      "id": 2,
+      "title": "w2",
+      "instructions": "review",
+      "read_files": ["src/auth/tokens.py"],
+      "refs": [],
+      "expected_output": "md"
+    }
+  ],
+  "merge_plan": "synthesize"
+}

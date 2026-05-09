@@ -1,0 +1,24 @@
+{
+  "n": 2,
+  "mode": "extend",
+  "strategy": "by_dimension",
+  "subtasks": [
+    {
+      "id": 1,
+      "title": "security",
+      "instructions": "Review through security lens.",
+      "read_files": ["src/auth/middleware.py", "src/auth/tokens.py"],
+      "refs": [],
+      "expected_output": "md"
+    },
+    {
+      "id": 2,
+      "title": "performance",
+      "instructions": "Review through performance lens.",
+      "read_files": ["src/auth/middleware.py", "src/auth/tokens.py"],
+      "refs": [],
+      "expected_output": "md"
+    }
+  ],
+  "merge_plan": "synthesize"
+}
