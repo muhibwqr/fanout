@@ -1,0 +1,6 @@
+version: 1
+profiles:
+  default: [base]
+modules:
+  base:
+    brew: [git, zsh, jq]

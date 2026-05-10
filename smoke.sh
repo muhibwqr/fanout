@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# Smoke test — three dry-runs across all three modes. Costs 3 planner calls.
+# Smoke — verify v3 subcommands work end-to-end without spending model tokens
+# (skips `fanout ai` which would call Claude).
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN="$DIR/run.sh"
 
-echo "=== smoke 1: extend / N=4 ==="
-"$RUN" "audit auth layer for security, perf, DX, and accessibility" \
-  --mode extend \
-  --repo "$DIR/tests/fixtures/sample_repo" \
-  --files "src/auth/*.py" "src/db/*.py" "src/api/*.py" "tests/auth/*.py" \
-  -n 4 --dry-run >/tmp/fanout_smoke_extend.json
-echo "ok — plan written to /tmp/fanout_smoke_extend.json"
+echo "=== smoke 1: pytest ==="
+( cd "$DIR" && python3 -m pytest -q )
 
-echo "=== smoke 2: greenfield / N=8 ==="
-"$RUN" "design a novel approach to interpretable agent memory" \
-  --mode greenfield \
-  -n 8 --dry-run >/tmp/fanout_smoke_greenfield.json
-echo "ok — plan written to /tmp/fanout_smoke_greenfield.json"
+echo
+echo "=== smoke 2: fanout --help ==="
+"$RUN" --help >/dev/null
+echo "ok"
 
-echo "=== smoke 3: scratch / N=4 ==="
-"$RUN" "build a CLI for tailing structured logs with jq-like filters" \
-  --mode scratch \
-  --refs "https://github.com/aurora/lnav" "https://stedolan.github.io/jq" \
-  -n 4 --dry-run >/tmp/fanout_smoke_scratch.json
-echo "ok — plan written to /tmp/fanout_smoke_scratch.json"
+echo
+echo "=== smoke 3: fanout plan --manifest manifests/default.yml --profile minimal ==="
+"$RUN" plan --manifest "$DIR/manifests/default.yml" --profile minimal | head -10
+echo "..."
+echo "ok"
+
+echo
+echo "=== smoke 4: fanout plan --manifest manifests/workstation-port.yml ==="
+"$RUN" plan --manifest "$DIR/manifests/workstation-port.yml" | head -10
+echo "..."
+echo "ok"
 
 echo
 echo "all smokes passed."

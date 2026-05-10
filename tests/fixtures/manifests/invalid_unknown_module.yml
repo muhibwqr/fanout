@@ -1,0 +1,6 @@
+version: 1
+profiles:
+  default: [base, ghost]
+modules:
+  base:
+    brew: [git]

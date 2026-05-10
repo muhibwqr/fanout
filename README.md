@@ -1,186 +1,183 @@
-# Operation Fanout (v0)
+# fanout
 
-Local multi-agent task decomposition: a single command becomes N independent subtasks, dispatched to N parallel `claude -p` workers, then reduced.
+> Declarative workstation bootstrap. Manifest in. Plan/apply/state/verify/rollback out.
 
-Spec: `../multi_agent_fanout.html`. NLA grounding: https://www.anthropic.com/research/natural-language-autoencoders.
+Forked the tool inventory from [LeuAlmeida/workstation](https://github.com/LeuAlmeida/workstation) (MIT). Replaced the architecture.
+
+The workstation repo is a 40 KB one-shot shell script: `sh startup.sh` and pray. Re-run = re-install collisions. Step 43 fails = half-configured machine. No idempotence, no plan/apply, no state, no rollback, no drift detection, no profiles, no verification.
+
+fanout fixes all of that. The tool list survives. The architecture is Terraform-for-laptop.
 
 ## Install
 
-Stdlib-only at runtime. Tests need pytest.
-
 ```sh
-chmod +x run.sh smoke.sh
-python3 -m pip install --user pytest
+git clone https://github.com/muhibwqr/fanout
+cd fanout
+chmod +x run.sh
+ln -sf "$(pwd)/run.sh" ~/.local/bin/fanout    # or anywhere on PATH
+python3 -m pip install --user pyyaml
 ```
 
-## Default flow (interactive)
+Tests: `python3 -m pytest -v`.
+
+## First run
 
 ```sh
-fanout "audit auth for security"
+fanout init                          # writes ~/.fanout/workstation.yml (the default manifest)
+fanout init --from-workstation       # alternative: ports LeuAlmeida/workstation's full inventory
+fanout plan                          # shows + (install) / - (remove) / = (keep) per bucket
+fanout apply                         # converges your machine to the manifest
+fanout state                         # shows what fanout owns
+fanout verify                        # runs the manifest's `verify.checks` commands
 ```
 
-This triggers, in order:
-1. **Intent Q&A**: a small LLM agent reads your command, prints 2-3 clarifying questions, you answer, the agent refines `command` / `mode` / `n` / `files` / `refs`.
-2. **Planner**: produces the JSON plan.
-3. **Plan gate**: shows the plan and prompts `[a]ccept / [e]dit / [r]egen / [q]uit`.  `e` opens `$EDITOR` on the plan JSON; `r` re-runs the planner.
-4. **tmux dispatch**: spawns N visible panes in a detached tmux session. Each pane runs `claude -p` for one worker, writes output to `/tmp/fanout_<id>/W<n>.out`, touches a `.done` sentinel. Orchestrator polls.
-5. **Reducer**: synthesises results per `merge_plan`.
-
-Attach the tmux session in another terminal to watch workers live:
+## Day after
 
 ```sh
-tmux attach -t fanout_<id>
+fanout state diff                    # detect drift since last apply
+brew install fzf                     # you install something off-manifest
+fanout state diff                    # → exits 2, reports + fzf as drift
+fanout edit                          # opens $EDITOR on the manifest; add fzf
+fanout apply                         # idempotent; nothing to install (already there); state updated
+fanout rollback                      # undoes last apply via the snapshot taken before it
 ```
 
-(The orchestrator prints the exact attach command.)
-
-## Quickstart
-
-Three modes; pick whichever fits the work.
-
-### Extend — work on an existing repo
+## AI mode
 
 ```sh
-./run.sh "audit auth layer for security, perf, DX" \
-  --mode extend \
-  --repo ~/work/api \
-  --files "src/auth/**/*.py" "tests/auth/**/*.py" \
-  -n 6
+fanout ai "set up a Python ML rig with PyTorch, Jupyter, and Docker"
 ```
 
-### Scratch — build new from references
+Claude generates the manifest. You see it. `[a]ccept / [e]dit / [r]egen / [q]uit`. On accept it writes to `~/.fanout/workstation.yml`. Then `fanout apply` like usual.
 
-```sh
-./run.sh "build a CLI for tailing structured logs with jq-like filters" \
-  --mode scratch \
-  --refs https://github.com/aurora/lnav https://stedolan.github.io/jq \
-  -n 4
+Requires the `claude` CLI on PATH (used as a subprocess; no API key handling).
+
+## Subcommands
+
+| Command | What it does |
+|---------|--------------|
+| `fanout init [--from-workstation] [--force]` | Write `~/.fanout/workstation.yml` from a template. |
+| `fanout edit` | `$EDITOR` on the manifest. |
+| `fanout plan [--profile X] [--manifest PATH]` | Diff: manifest vs installed. Pure read; no side effects. |
+| `fanout apply [--profile X] [--dry-run] [--no-snapshot] [--yes]` | Converge to manifest. Snapshot first by default. |
+| `fanout state` | Dump owned items as JSON. |
+| `fanout state diff` | Detect drift between owned set and reality. Exit 2 on drift. |
+| `fanout verify` | Run sanity-check commands from manifest's `verify.checks`. |
+| `fanout rollback [--dry-run]` | Restore the most recent snapshot. |
+| `fanout ai "<description>"` | Claude generates the manifest from prose. |
+| `fanout claude "task" "task" ...` | Bonus: dispatch N tasks to N parallel `claude -p` sessions in tmux panes. |
+
+## Manifest format
+
+```yaml
+version: 1
+
+profiles:
+  default: [base, web, cloud]
+  python-ml: [base, python, ml]
+
+modules:
+  base:
+    brew: [git, jq, ripgrep, fzf]
+  web:
+    brew: [node]
+    cask: [visual-studio-code]
+    npm_global: [typescript, yarn]
+  cloud:
+    brew: [awscli, kubectl]
+    cask: [docker]
+  python:
+    brew: [python]
+    pip: [poetry, ruff]
+    curl:
+      - name: nvm
+        marker: "~/.nvm/nvm.sh"
+        install: "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash"
+
+settings:
+  apply:
+    parallelism: 4
+    timeout: 900
+    snapshot_before: true
+  verify:
+    checks:
+      - cmd: "git --version"
+      - cmd: "node --version"
 ```
 
-### Greenfield — pure ideation
+**Buckets**: `brew`, `cask`, `npm_global`, `pip`, `curl`. Each maps to an adapter. Adding a new backend = one ~60 LOC file in `adapters/`.
 
-```sh
-./run.sh "design a novel approach to interpretable agent memory" \
-  --mode greenfield -n 8
-```
+**Curl items**: for tools that aren't in a package manager (NVM, Oh-My-Zsh, Docker Compose). Idempotent via a `marker` file/dir.
 
-## See the plan before workers run
+## Adapters
 
-```sh
-./run.sh "..." --dry-run --out-plan /tmp/plan.json
-# inspect /tmp/plan.json, edit if needed, then:
-./run.sh "..." --plan /tmp/plan.json
-```
+Five built in:
 
-`--dry-run` stops after the planner. `--plan <path>` skips the planner and runs workers from a hand-edited JSON file.
+- `brew` — `brew install/uninstall`, formulas
+- `cask` — `brew install --cask`, GUI apps
+- `npm_global` — `npm install -g`
+- `pip` — `pip install --user`
+- `curl` — marker-file-gated shell installer for third-party scripts
 
-## CLI flags
-
-| Flag | Meaning |
-|------|---------|
-| `-n {2,4,6,8,10}` | Number of workers. |
-| `--mode {scratch,extend,greenfield}` | Task shape. |
-| `--repo <path>` | Repo root (extend only). |
-| `--files <glob...>` | Repo-relative glob patterns (extend/scratch). |
-| `--refs <url-or-path...>` | Reference material (extend/scratch). |
-| `--dry-run` | Build plan, validate, print, exit. |
-| `--plan <path>` | Use a pre-written plan; skip planner. |
-| `--out-plan <path>` | Write the validated plan to disk. |
-| `--no-reducer` | Print raw worker outputs instead of synthesising. |
-| `--timeout <sec>` | Per-call timeout (default 600s). |
-| `--auto` | Skip intent Q&A and plan gate. For scripted use. |
-| `--no-intent` | Skip the intent Q&A only; plan gate still shown. |
-| `--no-tmux` | Force headless `asyncio.gather` dispatch. |
-| `--keep-tmux` | Don't kill the tmux session after workers finish — useful for inspection. |
-| `--lens` | NLA-grounded quality filter between workers and reducer. Buckets claims by specificity, ground-checks file:line, counts recurrence, reconstruction-verifies, scores each claim High/Med/Low. Replaces reducer with an auditor reducer that emits Findings / Details / Suspect / Worker-reliability sections. |
-| `--lens-retry` | Re-run any worker the lens flags as fake-success (one retry max, with steering: "ground every specific in a cited file:line, do not theorize"). |
-| `--lens-strict` | Drop low-trust claims instead of surfacing in Suspect. |
-| `--lens-report <path>` | Write the full LensReport JSON to disk for inspection / replay. |
-| `--lens-fast` | Skip per-claim reconstruction LLM call; cheaper but weaker filter. |
-
-## Exit codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Success. |
-| 1 | User-input error (bad flags, missing repo, etc). |
-| 2 | Plan failed validation. |
-| 3 | Backend (claude) error or partial worker failure. |
-| 130 | Ctrl-C. |
+Each implements `list_installed()`, `install(items)`, `uninstall(items)`. Easy to add more (`apt`, `cargo`, `gem`, `mise`, etc).
 
 ## Tests
 
 ```sh
-python3 -m pytest tests/ -v
+python3 -m pytest -v
 ```
 
-47 unit tests: bundle builder, repo-map fallback, file digests, robust JSON extraction, plan validation rules.
+Currently 42 unit tests across manifest, state, adapters. Subprocess fully mocked so tests stay offline.
 
-```sh
-./smoke.sh
-```
+## Why this is 10x better than `workstation`
 
-Three live `--dry-run` invocations against `claude -p` (one planner call each) covering all three modes. Output saved to `/tmp/fanout_smoke_*.json`.
-
-## Validation rules (`validate_plan`)
-
-- Schema: required keys, types, enum membership for `mode` / `strategy` / `merge_plan`.
-- N: `plan.n == requested n` and `len(subtasks) == n`. Duplicate titles surface as a "downscale" hint.
-- Mode contract: `extend` subtasks must have non-empty `read_files`; `scratch` / `greenfield` must have empty `read_files`.
-- Bundle membership: every `read_files` entry in extend mode must appear in the planner's bundle.
-- Overlap (`by_file` only): no pair of subtasks may share more than one file. `by_dimension` legitimately shares files; rule is strategy-aware.
-- Subtask ids 1..N, no duplicates.
-- Self-contained: instructions may not reference other workers' output (independence invariant).
-
-All errors are aggregated and reported together, not first-failure-only.
-
-## Design notes — NLA grounding
-
-Per Anthropic's Natural Language Autoencoders work, LLM verbalisations are *thematically* faithful but drift on specifics. Translated:
-
-- Trust planner's *strategy* and *titles* (themes).
-- Don't trust planner's *file paths* — `_check_files_in_bundle` rejects hallucinated paths.
-- The planner is invoked with `--json-schema`, locking thematic fields to enums while leaving free-form `instructions` open.
-
-## Lens mode (v2) — killing fake-success worker outputs
-
-`--lens` adds an eight-stage quality filter between worker dispatch and the reducer, applying the NLA paper's heuristics at the API level:
-
-1. Extract atomic claims from each worker (Claude judge).
-2. Bucket each claim as `theme` / `entity` / `detail`.
-3. Ground-check cited paths and lines against the bundle.
-4. Count recurrence within-worker + across-workers (Jaccard ≥ 0.4).
-5. Reconstruction: ask Claude "is this claim supported by cited content?".
-6. Score each claim → `high` / `med` / `low` trust.
-7. Score each worker → `fake_success_score`, `flagged_for_retry`.
-8. Emit `LensReport`; auditor-reducer produces a four-section report (Findings / Details / Suspect / Worker reliability).
-
-Why: at N≥4, some workers produce plausible-looking but mediocre output. The lens filters specifics that don't ground in the bundle, surfaces themes that recur across workers as high-trust, and flags workers whose output reads like an audit but cites no real code.
-
-Read the full design + flow chart in `multi_agent_fanout.html` Section XIV.
-
-## Limits (v0)
-
-- `claude -p` is invoked with `--tools ""` — workers cannot edit files. They return markdown only.
-- No URL fetching for `--refs`. Refs are passed to the model as text.
-- No retry on a failed worker; partial results are reduced and reported.
-- N=10 against a small file set in `by_file` mode will fail validation (overlap rule). Use `by_dimension` or smaller N.
-- No caching, no live tmux pane streaming, no Ollama backend (see roadmap in spec sec XI).
+| | workstation | fanout |
+|---|---|---|
+| Source format | 40 KB bash script | ~70 line YAML manifest |
+| Idempotence | No | Yes |
+| Plan before apply | No | `fanout plan` |
+| Profiles | No (fork the script) | `--profile python-ml` |
+| State tracking | None | `~/.fanout/state.json` |
+| Drift detection | None | `fanout state diff` |
+| Rollback | None | `fanout rollback` |
+| Verify install actually works | None | `fanout verify` |
+| AI manifest generation | None | `fanout ai "..."` |
+| Visible parallel installs | None | tmux pane dispatch (planned for `apply --tmux`) |
+| New adapter cost | Edit shell script | One ~60 LOC `adapters/X.py` |
 
 ## Layout
 
 ```
 fanout/
-  fanout.py        orchestrator, planner call, validator, extract_json
-  context.py       bundle builder, repo_map, file_digest
-  prompts.py       PLANNER_SYSTEM, REDUCER_SYSTEM, PLANNER_SCHEMA
-  workers.py       call_claude wrapper, envelope parser
-  run.sh           entrypoint
-  smoke.sh         3-mode dry-run smoke
+  fanout.py               # subcommand router
+  manifest.py             # YAML parse + validate + profile resolve + diff
+  state.py                # state file IO + snapshots + drift detection
+  engine.py               # plan / apply / verify / rollback orchestrator
+  workers.py              # tmux dispatch (used by `fanout claude` + `apply --tmux`)
+  prompts.py              # AI-mode system prompt for `fanout ai`
+  adapters/
+    base.py               # Adapter base class + InstallResult
+    brew.py               # brew formula + cask
+    npm.py                # npm -g
+    pip.py                # pip --user
+    curl_script.py        # marker-file-gated curl installs
+  manifests/
+    default.yml           # starter manifest
+    workstation-port.yml  # LeuAlmeida/workstation's inventory, ported
   tests/
-    test_context.py
-    test_validate.py
-    test_extract_json.py
-    fixtures/sample_repo/
-    sample_plans/*.json
+    test_manifest.py
+    test_state.py
+    test_adapters.py
+  NOTICE.md               # attribution to upstream
+  LICENSE                 # MIT
 ```
+
+## Attribution
+
+Tool inventory in `manifests/workstation-port.yml` derived from
+[LeuAlmeida/workstation](https://github.com/LeuAlmeida/workstation) (MIT).
+See `NOTICE.md`.
+
+## License
+
+MIT.

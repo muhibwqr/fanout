@@ -1,0 +1,23 @@
+version: 1
+profiles:
+  default: [base, web]
+  python-ml: [base, python, ml]
+  minimal: [base]
+modules:
+  base:
+    brew: [git, zsh]
+    curl:
+      - { name: oh-my-zsh, marker: "~/.oh-my-zsh", install: "echo install-omz" }
+  python:
+    brew: [python@3.12]
+    pip: [poetry, ruff]
+  ml:
+    pip: [torch, jupyter]
+  web:
+    brew: [node]
+    cask: [visual-studio-code]
+    npm_global: [typescript, yarn]
+settings:
+  apply:
+    parallelism: 4
+    timeout: 600
