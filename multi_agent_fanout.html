@@ -1,0 +1,609 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operation Fanout — Applying NLA's verification discipline to multi-agent pipelines</title>
+<style>
+  :root {
+    --bg: #f4ecd8;
+    --bg-soft: #ede4cd;
+    --bg-card: #faf3e0;
+    --ink: #1a1a1a;
+    --ink-soft: #2a2722;
+    --muted: #5a5650;
+    --dim: #8a857c;
+    --rule: #d8cfb8;
+    --rule-strong: #b8ad94;
+    --accent: #7a3b2e;
+    --accent-soft: #a35d4d;
+    --accent2: #2c4a6b;
+    --success: #3d6b3a;
+    --hl: #f4d97f;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--ink); margin: 0; }
+  body {
+    font-family: "Apple Garamond", "ITC Garamond", "EB Garamond", Garamond, "Times New Roman", Arial, serif;
+    font-size: 18px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 72px 28px 120px; }
+
+  header.hero { padding: 0 0 36px; border-bottom: 1px solid var(--rule); margin-bottom: 40px; }
+  h1 { font-family: inherit; font-weight: 600; font-size: 40px; line-height: 1.1; letter-spacing: -0.01em; margin: 0 0 18px; }
+  h2 { font-family: inherit; font-weight: 600; font-size: 26px; margin: 56px 0 14px; letter-spacing: -0.005em; }
+  h2 .num { color: var(--dim); font-weight: 400; margin-right: 12px; font-variant-numeric: oldstyle-nums; }
+  h3 { font-family: inherit; font-weight: 600; font-size: 19px; margin: 28px 0 10px; }
+  h4 { font-family: Arial, sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; }
+  p, li { color: var(--ink-soft); }
+  .lead { font-size: 21px; line-height: 1.5; color: var(--ink); margin: 0; }
+  .byline { font-family: Arial, sans-serif; font-size: 12px; letter-spacing: 0.06em; color: var(--muted); text-transform: uppercase; margin: 18px 0 0; }
+
+  nav.toc { border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); padding: 14px 0; margin: 0 0 40px; font-family: Arial, sans-serif; font-size: 12px; letter-spacing: 0.04em; color: var(--muted); }
+  nav.toc a { color: var(--muted); text-decoration: none; margin-right: 18px; }
+  nav.toc a:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+
+  ul, ol { padding-left: 24px; }
+  li { margin: 6px 0; }
+  hr { border: none; border-top: 1px solid var(--rule); margin: 56px 0; }
+  em { font-style: italic; }
+  strong, b { font-weight: 600; }
+  .footnote { color: var(--muted); font-size: 14px; font-style: italic; }
+
+  code, pre, kbd, samp { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+  pre {
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--ink);
+  }
+  code.inline {
+    background: var(--bg-card);
+    padding: 1px 6px;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    font-size: 14px;
+    color: var(--accent);
+  }
+
+  .panel { background: var(--bg-card); border: 1px solid var(--rule); border-radius: 4px; padding: 20px 24px; margin: 18px 0; }
+
+  figure { margin: 24px 0; }
+  figure svg { display: block; max-width: 100%; height: auto; background: var(--bg-card); border: 1px solid var(--rule); border-radius: 4px; }
+  figcaption { font-family: Arial, sans-serif; font-size: 12px; letter-spacing: 0.04em; color: var(--muted); margin-top: 8px; text-transform: uppercase; }
+  svg text { font-family: Arial, sans-serif; fill: var(--ink); }
+
+  button, .btn { background: var(--bg); color: var(--ink); border: 1px solid var(--rule-strong); border-radius: 3px; padding: 7px 14px; font-family: Arial, sans-serif; font-size: 13px; cursor: pointer; letter-spacing: 0.02em; }
+  button:hover { background: var(--bg-soft); border-color: var(--ink); }
+  button.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); font-weight: 600; }
+  button.primary:hover { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+  input[type=text], textarea, select { background: var(--bg-card); color: var(--ink); border: 1px solid var(--rule-strong); border-radius: 3px; padding: 8px 12px; font-family: Arial, sans-serif; font-size: 14px; width: 100%; }
+  input[type=text]:focus, textarea:focus, select:focus { outline: none; border-color: var(--ink); }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  label { font-family: Arial, sans-serif; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); display: block; margin-bottom: 6px; font-weight: 600; }
+
+  .modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 18px 0 22px; }
+  .mode-card { background: var(--bg-card); border: 1px solid var(--rule); border-radius: 4px; padding: 18px; cursor: pointer; transition: border-color 0.12s ease; }
+  .mode-card:hover { border-color: var(--rule-strong); }
+  .mode-card.active { border-color: var(--ink); border-width: 1px; box-shadow: inset 0 0 0 1px var(--ink); }
+  .mode-card h4 { color: var(--ink); margin: 0 0 8px; text-transform: none; letter-spacing: 0; font-family: inherit; font-size: 18px; font-weight: 600; }
+  .mode-card .desc { color: var(--muted); font-size: 14px; margin: 0 0 12px; line-height: 1.45; }
+  .mode-card .row { font-family: Arial, sans-serif; font-size: 11px; color: var(--muted); margin: 3px 0; letter-spacing: 0.02em; }
+  .mode-card .row b { color: var(--ink); font-weight: 600; }
+  @media (max-width: 700px) { .modes { grid-template-columns: 1fr; } }
+
+  .demo { background: var(--bg-card); border: 1px solid var(--rule); border-radius: 4px; padding: 22px; margin: 20px 0; }
+  .demo .controls { display: grid; grid-template-columns: 1fr auto auto; gap: 14px; align-items: end; margin-bottom: 14px; }
+  .demo .controls .nslider { min-width: 220px; }
+  @media (max-width: 720px) { .demo .controls { grid-template-columns: 1fr; } }
+  .demo .ctx-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 12px 0; }
+  @media (max-width: 720px) { .demo .ctx-fields { grid-template-columns: 1fr; } }
+  .demo .out { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+  @media (max-width: 900px) { .demo .out { grid-template-columns: 1fr; } }
+  .demo .col { background: var(--bg); border: 1px solid var(--rule); border-radius: 3px; padding: 14px; min-height: 220px; }
+  .demo .col h5 { margin: 0 0 10px; color: var(--muted); font-size: 11px; font-family: Arial, sans-serif; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700; }
+
+  .worker-grid { display: grid; gap: 10px; margin: 8px 0; }
+  .worker { background: var(--bg-card); border: 1px solid var(--rule); border-radius: 3px; padding: 10px 12px; font-size: 13px; line-height: 1.5; }
+  .worker .wtitle { font-weight: 600; color: var(--accent); font-size: 13px; }
+  .worker .winstr { color: var(--ink); margin: 4px 0 4px; }
+  .worker .wfiles { color: var(--dim); font-family: "SF Mono", Menlo, monospace; font-size: 11.5px; margin-top: 4px; }
+
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-family: Arial, sans-serif; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  thead th { border-bottom: 1px solid var(--ink); color: var(--ink); font-weight: 700; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+  td.num { font-family: "SF Mono", Menlo, monospace; }
+
+  .tags { margin: 18px 0 0; font-family: Arial, sans-serif; font-size: 12px; color: var(--muted); letter-spacing: 0.04em; }
+  .tags span { margin-right: 14px; }
+  .tags span::before { content: "·"; margin-right: 6px; color: var(--rule-strong); }
+  .tags span:first-child::before { content: ""; margin: 0; }
+
+  .pull { border-left: 2px solid var(--accent); padding: 4px 0 4px 14px; margin: 22px 0; color: var(--ink); font-style: italic; font-size: 19px; }
+
+  .lead.drop::first-letter { font-size: 60px; line-height: 0.9; float: left; padding: 6px 10px 0 0; font-weight: 600; color: var(--accent); }
+
+  .claim { background: var(--bg-card); border: 1px solid var(--rule); border-left: 3px solid var(--accent); padding: 14px 18px; margin: 12px 0; border-radius: 0; }
+  .claim h4 { color: var(--accent); margin: 0 0 6px; font-size: 12px; }
+  .claim p { margin: 0; }
+</style>
+</head>
+<body>
+<main>
+
+<header class="hero">
+  <p class="byline" style="margin: 0 0 14px;">Operation Fanout</p>
+  <h1>Applying NLA's verification discipline to multi-agent pipelines</h1>
+  <p class="lead drop">The Anthropic Natural Language Autoencoders paper proves something more general than its title suggests: LLM verbalisation has a signature failure mode. Themes faithful, specifics drift, true claims recur, false claims do not. If that signature is universal to verbalisation — and there is no reason it should be limited to activation-to-text — the same heuristics work on any LLM output. Fanout is the engineering test of that claim.</p>
+  <p class="byline">A direct translation of NLA reading discipline into a working multi-agent CLI</p>
+  <p class="tags">
+    <span>github.com/muhibwqr/fanout</span><span>local-first</span><span>N ∈ {2, 4, 6, 8, 10}</span><span>v2 shipped 2026-05-10</span>
+  </p>
+</header>
+
+<nav class="toc">
+  <a href="#problem">Problem</a>
+  <a href="#nla">NLA findings</a>
+  <a href="#innovation">Innovation</a>
+  <a href="#arch">Architecture</a>
+  <a href="#stages">Lens stages</a>
+  <a href="#demo">Try it</a>
+  <a href="#cli">CLI</a>
+  <a href="#limits">Limits</a>
+</nav>
+
+<!-- PROBLEM -->
+<h2 id="problem"><span class="num">I.</span>The problem with multi-agent at scale</h2>
+
+<p>Run four LLM agents in parallel. Three return real work. One returns a report shaped exactly like real work — same headings, same severity tags, same imperative tone — that on close reading turns out to cite a file that does not exist, or invents a line number, or recommends a library nobody wrote. The reducer ingests all four. The user reads the synthesis, acts on a finding that was hallucinated, and learns nothing about which worker invented it.</p>
+
+<p>This is not a bug in any one model. It is a property of how language models verbalise complex internal state under pressure. Detecting the property is the work; once you detect it the rest of the engineering is straightforward.</p>
+
+<p class="pull">Five sessions running in parallel is a fast queue. Five sessions whose output you can <em>trust</em> is a method.</p>
+
+<!-- NLA -->
+<h2 id="nla"><span class="num">II.</span>What the NLA paper actually proved</h2>
+
+<p>Anthropic's <a href="https://www.anthropic.com/research/natural-language-autoencoders" style="color: var(--accent); border-bottom: 1px solid var(--accent); text-decoration: none;">Natural Language Autoencoders</a> (May 2026) trained an autoencoder pair: a verbaliser that turns model activations into text, a reconstructor that turns the text back into activations. The optimisation target is reconstruction loss — nothing in the loss explicitly rewards readability or honesty. What emerges is the interesting part. Five empirical findings, in order of how load-bearing each is for fanout:</p>
+
+<ol>
+  <li><b>Themes are faithful; specifics drift.</b> Verbalisations correctly name the shape of what an activation encodes (Korean dynastic records, security audit, planning a rhyme). They incorrectly name specific entities and details that fit the shape (a king who was not mentioned, a file that does not exist, a line number invented to look concrete).</li>
+  <li><b>True claims recur across token positions; false claims do not.</b> A claim that appears in the verbalisation at multiple adjacent tokens is more likely to be supported by the underlying activation. Singletons should be read with suspicion.</li>
+  <li><b>The reconstructor is a partial verifier.</b> Removing a true claim from a verbalisation hurts reconstruction loss more than removing a false one. The text you can take out without breaking the round-trip is text the activation did not really need.</li>
+  <li><b>Confabulation rate is roughly flat across training.</b> More RL does not fix it. The signature is not an artefact of an under-trained verbaliser; it is a property of the verbalisation regime itself.</li>
+  <li><b>Reading discipline beats fine-tuning.</b> Anthropic's own practice: "read NLA explanations for the themes they surface rather than for single claims, and corroborate findings with independent methods before fully trusting them." NLA-equipped auditing agents identified the root cause of an intentionally misaligned model <em>without</em> training-data access — by reading themes and corroborating.</li>
+</ol>
+
+<p>The paper's framing is "we built a tool for interpretability researchers to read activations." The framing one level up is: <em>this is what LLM verbalisation looks like when you can measure it against a known signal.</em> The signal is reconstruction loss in the paper. In product code, the signal is whether the verbalisation grounds in observable reality (file content, repo state, runtime behaviour).</p>
+
+<!-- INNOVATION -->
+<h2 id="innovation"><span class="num">III.</span>The innovation, in three claims</h2>
+
+<p>Fanout is not "uses NLAs." It is the claim that NLA's empirical findings describe a property of LLM verbalisation that survives outside the autoencoder regime — and the engineering payoff of taking that claim seriously inside a multi-agent CLI. Three concrete claims, each falsifiable:</p>
+
+<div class="claim">
+<h4>Claim 1 — Universal signature</h4>
+<p>The four findings above describe LLM verbalisation in general, not the autoencoder pipeline specifically. A worker producing a markdown audit report is verbalising its task model. Themes will be faithful. Specifics will drift. True claims will repeat. False claims will not. The paper measured this with reconstruction MSE. We measure it with file:line ground-truth checks against the bundle the planner already supplied. <em>Falsifiable</em>: if confabulated specifics in worker output do not cluster on absent paths and out-of-range lines, the claim fails.</p>
+</div>
+
+<div class="claim">
+<h4>Claim 2 — Cross-agent recurrence is a stronger signal than within-token recurrence</h4>
+<p>The paper measures recurrence within a single verbalisation (same claim across adjacent tokens). Multi-agent pipelines provide a second axis: independent workers, run on the same plan, raising the same claim. Worker independence is enforced at the validator (no worker reads another's output, no shared <code class="inline">read_files</code> overlap beyond one for <code class="inline">by_file</code> strategy). Cross-worker recurrence is therefore information not available to a single-agent NLA — it is corroboration in the strict statistical sense. <em>Falsifiable</em>: if cross-worker-recurring claims are not measurably more accurate than singletons, the claim fails.</p>
+</div>
+
+<div class="claim">
+<h4>Claim 3 — Filter at the API boundary, not in the model</h4>
+<p>The paper observes that NLA RL does not reduce confabulation rate over training. The architectural lesson: don't try to make the verbaliser honest; build the verifier as load-bearing infrastructure around it. Fanout puts the verifier between worker dispatch and reducer, where the bundle is still in scope. The reducer never sees raw worker output; it sees a <code class="inline">LensReport</code> with claims pre-bucketed into trust bands. <em>Falsifiable</em>: if filtered output is not measurably more useful than unfiltered output on the same task, the claim fails.</p>
+</div>
+
+<p>Each claim is the kind of statement a research paper would defend with an evaluation. We defend them with a working CLI and an open repo: <a href="https://github.com/muhibwqr/fanout" style="color: var(--accent); border-bottom: 1px solid var(--accent); text-decoration: none;">github.com/muhibwqr/fanout</a>. The fixtures intentionally include confabulated worker outputs so the test suite verifies the filter's behaviour against the failure mode the paper documents.</p>
+
+<p class="pull">NLA's finding is that LLM verbalisation has a signature. Fanout's bet is that the signature is portable. The repo is the test.</p>
+
+<!-- ARCHITECTURE -->
+<h2 id="arch"><span class="num">IV.</span>Architecture</h2>
+
+<p>The pipeline is four stages on the unfiltered path, six with the lens layer engaged. Workers are <code class="inline">claude -p</code> subprocesses dispatched in parallel via <code class="inline">asyncio.gather</code> (headless) or visible tmux panes. Workers do not communicate. The validator enforces independence at plan time; the lens enforces verification at output time.</p>
+
+<figure>
+<svg viewBox="0 0 920 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="End-to-end fanout pipeline">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+    </marker>
+  </defs>
+
+  <rect x="20"  y="160" width="120" height="60" rx="2" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="80" y="188" text-anchor="middle" font-size="13" fill="#1a1a1a" font-weight="600">Command</text>
+  <text x="80" y="206" text-anchor="middle" font-size="11" fill="#5a5650">+ N + mode</text>
+
+  <rect x="180" y="160" width="140" height="60" rx="2" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="250" y="188" text-anchor="middle" font-size="13" fill="#1a1a1a" font-weight="600">Planner</text>
+  <text x="250" y="206" text-anchor="middle" font-size="11" fill="#5a5650">JSON plan + validate</text>
+
+  <rect x="360" y="160" width="140" height="60" rx="2" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="430" y="188" text-anchor="middle" font-size="13" fill="#1a1a1a" font-weight="600">Dispatcher</text>
+  <text x="430" y="206" text-anchor="middle" font-size="11" fill="#5a5650">N parallel workers</text>
+
+  <rect x="540" y="40"  width="150" height="50" rx="2" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="615" y="68" text-anchor="middle" font-size="12" fill="#1a1a1a">W1</text>
+  <rect x="540" y="105" width="150" height="50" rx="2" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="615" y="133" text-anchor="middle" font-size="12" fill="#1a1a1a">W2</text>
+  <rect x="540" y="170" width="150" height="50" rx="2" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="615" y="198" text-anchor="middle" font-size="12" fill="#1a1a1a">W3</text>
+  <rect x="540" y="235" width="150" height="50" rx="2" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="615" y="263" text-anchor="middle" font-size="12" fill="#1a1a1a">… W<tspan font-style="italic">N</tspan></text>
+
+  <rect x="730" y="40" width="160" height="245" rx="2" fill="#faf3e0" stroke="#7a3b2e" stroke-width="1.5"/>
+  <text x="810" y="65" text-anchor="middle" font-size="13" fill="#7a3b2e" font-weight="700">LENS LAYER</text>
+  <text x="810" y="86" text-anchor="middle" font-size="11" fill="#5a5650">extract claims</text>
+  <text x="810" y="104" text-anchor="middle" font-size="11" fill="#5a5650">bucket specificity</text>
+  <text x="810" y="122" text-anchor="middle" font-size="11" fill="#5a5650">ground-check</text>
+  <text x="810" y="140" text-anchor="middle" font-size="11" fill="#5a5650">recurrence</text>
+  <text x="810" y="158" text-anchor="middle" font-size="11" fill="#5a5650">reconstruction</text>
+  <text x="810" y="176" text-anchor="middle" font-size="11" fill="#5a5650">score claims</text>
+  <text x="810" y="194" text-anchor="middle" font-size="11" fill="#5a5650">score workers</text>
+  <text x="810" y="212" text-anchor="middle" font-size="11" fill="#5a5650">bucket → report</text>
+  <text x="810" y="244" text-anchor="middle" font-size="10" fill="#5a5650" font-style="italic">flagged?</text>
+  <text x="810" y="260" text-anchor="middle" font-size="10" fill="#7a3b2e" font-style="italic">retry once →</text>
+
+  <rect x="320" y="305" width="280" height="50" rx="2" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="460" y="330" text-anchor="middle" font-size="13" fill="#1a1a1a" font-weight="600">Auditor reducer</text>
+  <text x="460" y="346" text-anchor="middle" font-size="11" fill="#5a5650">structured report (4 sections)</text>
+
+  <line x1="140" y1="190" x2="180" y2="190" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="320" y1="190" x2="360" y2="190" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="500" y1="190" x2="540" y2="65"  stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="500" y1="190" x2="540" y2="130" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="500" y1="190" x2="540" y2="195" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="500" y1="190" x2="540" y2="260" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="690" y1="65"  x2="730" y2="65"  stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="690" y1="130" x2="730" y2="130" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="690" y1="195" x2="730" y2="195" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="690" y1="260" x2="730" y2="260" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+
+  <path d="M 730 270 Q 615 295 460 305" fill="none" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#ar)"/>
+
+  <path d="M 810 280 Q 810 295 615 295 Q 540 295 540 270" fill="none" stroke="#7a3b2e" stroke-width="1.0" stroke-dasharray="4,3" marker-end="url(#ar)"/>
+  <text x="660" y="290" font-size="9" fill="#7a3b2e" font-style="italic">--lens-retry</text>
+</svg>
+<figcaption>Fig. 1 — Command → planner → N workers → lens → auditor reducer. Dashed line: optional retry of flagged worker.</figcaption>
+</figure>
+
+<p>The lens layer is the new component. Each of its eight stages implements one of the paper's findings (table next section). The auditor reducer never sees raw worker output — it sees the <code class="inline">LensReport</code>, which is the paper's "themes versus specifics" reading discipline rendered as a data structure.</p>
+
+<!-- STAGES -->
+<h2 id="stages"><span class="num">V.</span>The lens, stage by stage</h2>
+
+<p>Eight stages. Each stage exists because the paper supplied a finding that requires it. Removing any stage degrades the filter against a specific failure mode the paper documented.</p>
+
+<table>
+  <thead><tr><th style="width: 8%;">#</th><th style="width: 32%;">Stage</th><th style="width: 30%;">Implements (NLA paper)</th><th>Why this stage exists</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td><b>Extract claims.</b> Claude judge per worker output emits an array of atomic factual claims with cited paths and lines.</td><td>Mirrors the Haiku 4.5 judge the paper used to characterise confabulations.</td><td>Aggregate scoring requires atomic units. Whole-document trust is too coarse.</td></tr>
+    <tr><td class="num">2</td><td><b>Bucket specificity</b> as <em>theme</em> / <em>entity</em> / <em>detail</em>.</td><td>"Thematic claims are more accurate than specific ones."</td><td>The paper's strongest finding for product use. Themes default to trust; specifics default to verify.</td></tr>
+    <tr><td class="num">3</td><td><b>Ground-check</b> cited paths and line numbers against the bundle the planner saw.</td><td>Confabulation characterisation: false specifics anchor to true themes.</td><td>The cheapest stage. Pure-Python, no LLM call. Catches "src/auth/oauth.py" when no such file exists in the bundle.</td></tr>
+    <tr><td class="num">4</td><td><b>Recurrence count</b> within-worker (mentions across the worker's own output) and across-workers (independent corroboration). Jaccard token-set match, threshold 0.4.</td><td>"True claims recur across token positions."</td><td>Cheapest reliability signal. Cross-worker recurrence is the multi-agent generalisation the paper does not reach.</td></tr>
+    <tr><td class="num">5</td><td><b>Reconstruction.</b> One Claude call per claim: "given the cited file content, is this claim supported, partially supported, or unsupported?" Strict on details, lenient on themes.</td><td>"AR partially distinguishes true from false claims" — removing true claims hurts reconstruction more than removing false ones.</td><td>The most expensive stage. Disable with <code class="inline">--lens-fast</code>. The closest analog to the AR's role in the original autoencoder.</td></tr>
+    <tr><td class="num">6</td><td><b>Score each claim</b> via a rule table → <em>high</em> / <em>med</em> / <em>low</em> trust + rationale.</td><td>Synthesises stages 2–5.</td><td>Single trust value per claim; rationale string explains the assignment so the user can audit the auditor.</td></tr>
+    <tr><td class="num">7</td><td><b>Score each worker.</b> <code class="inline">fake_success_score</code> = 1 − (high-trust-specifics / total claims). Flag for retry when low grounded-density + high theme-only ratio.</td><td>Detects "fake successful" outputs at the worker boundary — the production-engineering version of unverbalised evaluation awareness.</td><td>If a worker's report reads like an audit but cites no real code, it pattern-matched the genre instead of doing the work.</td></tr>
+    <tr><td class="num">8</td><td><b>Bucket globally</b> into <em>high_trust</em>, <em>med_trust</em>, <em>low_trust</em>, <em>suspect</em>. Emit <code class="inline">LensReport</code>.</td><td>"Read NLA explanations for the themes they surface … corroborate before fully trusting."</td><td>The paper's reading discipline rendered as a data structure the auditor reducer consumes.</td></tr>
+  </tbody>
+</table>
+
+<h3>The auditor reducer's output</h3>
+
+<p>The reducer receives the <code class="inline">LensReport</code> — never raw worker output — and emits a four-section markdown report. Sections mirror the paper's discipline directly.</p>
+
+<pre># Findings (high trust)
+Lead with thematic claims that reconstruction supports + grounded entities.
+Cite W{i}.
+
+# Details (verified)
+Specific file:line claims that ground-truth-checked AND reconstruction-supported.
+Act on these without re-checking. Cite W{i} with path:line.
+
+# Suspect — verify before acting
+Low-trust claims, kept but flagged with the failure mode:
+  - "no such file"               (path absent from bundle)
+  - "line out of range"          (line beyond excerpt)
+  - "no support in cited content" (reconstruction unsupported)
+Paper says false claims are often *thematically related* to the truth and
+may seed real findings. Don't delete them. Don't trust them either.
+
+# Worker reliability
+W1 — 6 high, 2 med, 1 low. fake_success_score=0.18.   reliable
+W2 — 1 high, 1 med, 4 low. fake_success_score=0.83.   flagged, retried
+W3 — 5 high, 3 med, 0 low. fake_success_score=0.27.
+W4 — 0 high, 0 med, 0 low. fake_success_score=1.00.   retry produced nothing
+</pre>
+
+<p>The Suspect section is the part most people initially want to delete. The paper's data argues against deletion: false claims tend to be thematically related to the truth and sometimes seed real findings on follow-up. Surface them with their failure mode; do not silently incorporate them into the synthesis.</p>
+
+<!-- DEMO -->
+<h2 id="demo"><span class="num">VI.</span>Try it — see the plan before any worker runs</h2>
+
+<p>The same legibility principle the lens applies post-worker also applies pre-worker. Type a command, pick a mode, drag the slider for <em>N</em>. The planner shape and the worker grid update in place. No live model call here — this is a small heuristic mirroring the JSON contract the real planner returns.</p>
+
+<div class="modes" id="modeSwitcher">
+  <div class="mode-card m1" data-mode="scratch">
+    <h4>Scratch</h4>
+    <p class="desc">Build new from inspiration only. References, no existing code.</p>
+    <div class="row"><b>Inputs:</b> <code class="inline">--refs</code></div>
+    <div class="row"><b>Best for:</b> prototype, hackathon</div>
+  </div>
+  <div class="mode-card m2 active" data-mode="extend">
+    <h4>Extend</h4>
+    <p class="desc">Existing repo plus targeted files. The default for real engineering work.</p>
+    <div class="row"><b>Inputs:</b> <code class="inline">--repo --files --refs</code></div>
+    <div class="row"><b>Best for:</b> refactor, audit, feature add</div>
+  </div>
+  <div class="mode-card m3" data-mode="greenfield">
+    <h4>Greenfield</h4>
+    <p class="desc">Pure brainstorm. Divergent search by competing hypotheses.</p>
+    <div class="row"><b>Inputs:</b> command only</div>
+    <div class="row"><b>Best for:</b> ideation, research</div>
+  </div>
+</div>
+
+<div class="panel" id="modeContext"></div>
+
+<div class="demo">
+  <div class="controls">
+    <div>
+      <label for="cmdInput">Command</label>
+      <input id="cmdInput" type="text" value="audit auth layer for security, perf, DX">
+    </div>
+    <div class="nslider">
+      <label>N = <span id="nVal">4</span></label>
+      <input id="nRange" type="range" min="1" max="5" step="1" value="2">
+    </div>
+    <div>
+      <button class="primary" id="runBtn">Plan</button>
+    </div>
+  </div>
+
+  <div class="ctx-fields">
+    <div>
+      <label for="repoInput">--repo</label>
+      <input id="repoInput" type="text" value="~/work/api">
+    </div>
+    <div>
+      <label for="filesInput">--files</label>
+      <input id="filesInput" type="text" value='src/auth/**/*.py tests/auth/**/*.py'>
+    </div>
+  </div>
+  <div>
+    <label for="refsInput">--refs</label>
+    <input id="refsInput" type="text" value="https://owasp.org/Top10">
+  </div>
+
+  <div class="out">
+    <div class="col">
+      <h5>plan.json</h5>
+      <pre id="planOut" style="margin:0; background:transparent; border:none; padding:0; font-size:12px;"></pre>
+    </div>
+    <div class="col">
+      <h5>worker fanout</h5>
+      <div class="worker-grid" id="workerGrid"></div>
+    </div>
+  </div>
+</div>
+
+<!-- CLI -->
+<h2 id="cli"><span class="num">VII.</span>The CLI surface, in one breath</h2>
+
+<pre>fanout "audit auth for security" --mode extend \
+  --repo ~/work/api \
+  --files "src/auth/**/*.py" \
+  -n 4 --lens --lens-retry</pre>
+
+<table>
+  <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code class="inline">-n {2,4,6,8,10}</code></td><td>Number of parallel workers.</td></tr>
+    <tr><td><code class="inline">--mode {scratch,extend,greenfield}</code></td><td>Task shape.</td></tr>
+    <tr><td><code class="inline">--repo / --files / --refs</code></td><td>Context inputs (validated per mode).</td></tr>
+    <tr><td><code class="inline">--dry-run</code></td><td>Stop after planner; print plan.</td></tr>
+    <tr><td><code class="inline">--plan &lt;path&gt;</code></td><td>Skip planner; load plan from JSON. Pairs with <code class="inline">--out-plan</code>.</td></tr>
+    <tr><td><code class="inline">--auto</code></td><td>Skip the intent Q&amp;A and the plan-approval gate.</td></tr>
+    <tr><td><code class="inline">--no-tmux</code></td><td>Force headless dispatch.</td></tr>
+    <tr><td><code class="inline">--lens</code></td><td>Run the eight-stage lens; replace reducer with auditor reducer.</td></tr>
+    <tr><td><code class="inline">--lens-retry</code></td><td>Re-run flagged workers once with steering ("ground every specific in a cited file:line, do not theorize").</td></tr>
+    <tr><td><code class="inline">--lens-strict</code></td><td>Drop low-trust claims entirely instead of surfacing in Suspect.</td></tr>
+    <tr><td><code class="inline">--lens-report &lt;path&gt;</code></td><td>Write full <code class="inline">LensReport</code> JSON to disk.</td></tr>
+    <tr><td><code class="inline">--lens-fast</code></td><td>Skip per-claim reconstruction (cheaper; weaker filter).</td></tr>
+  </tbody>
+</table>
+
+<!-- LIMITS -->
+<h2 id="limits"><span class="num">VIII.</span>Honest limits</h2>
+
+<p>The translation from research finding to product filter is incomplete in three ways. Naming each is part of the work.</p>
+
+<ul>
+  <li><b>No real activations.</b> Claude is closed; we cannot run a verbaliser on its activations. The lens applies the paper's heuristics to <em>worker output</em>, which is the closest observable analog. The paper's claims about activations are stronger than ours about text — we inherit only the heuristics that survive the abstraction. Real-NLA integration via Neuronpedia or Hugging Face would require running workers on Qwen/Gemma/Llama in parallel; deferred.</li>
+  <li><b>Cross-agent recurrence is informally measured.</b> Jaccard token-set with threshold 0.4 is a crude proxy for "same claim." Embedding-based matching would be tighter but adds a dependency. v3 territory.</li>
+  <li><b>Tokens are not free.</b> Lens mode adds claim-extraction (1 call per worker) plus reconstruction (1 call per claim) plus the auditor reducer. For a four-worker, twelve-claim audit, lens roughly doubles the LLM call count. The argument is not "fewer tokens" but "tokens spent on verified signal rather than mediocre confabulation." Where the user prefers raw tokens and serial reading, omit <code class="inline">--lens</code>.</li>
+</ul>
+
+<p>The repo is open: <a href="https://github.com/muhibwqr/fanout" style="color: var(--accent); border-bottom: 1px solid var(--accent); text-decoration: none;">github.com/muhibwqr/fanout</a>. Tests are 78 unit + a smoke script. Three commits: v0 (planner + workers + reducer), v1 (intent loop + tmux + plan gate), v2 (lens layer + auditor reducer). The lens fixtures intentionally include confabulated worker outputs cited in this essay so that running the test suite verifies the filter against the failure mode the paper describes.</p>
+
+<hr>
+<p class="footnote">Local-first. No external scripts, no telemetry, no API keys at rest. Built and shipped in two days of focused work, on top of two days of essay writing. The essay is in the <code class="inline">git log</code>.</p>
+
+</main>
+
+<script>
+(function(){
+  const modeCards = document.querySelectorAll('#modeSwitcher .mode-card');
+  const modeContext = document.getElementById('modeContext');
+  const repoInput = document.getElementById('repoInput');
+  const filesInput = document.getElementById('filesInput');
+  const refsInput = document.getElementById('refsInput');
+
+  let currentMode = 'extend';
+
+  const modeBlurb = {
+    scratch: `<h4>Scratch — building from inspiration</h4>
+      <p>The planner sees only a list of references — URLs, design docs, papers. No existing code. Strategy gravitates toward <em>by_phase</em> (research, design, code, tests) or <em>by_hypothesis</em> (try several distinct approaches in parallel).</p>
+      <p class="footnote">Tip: include refs that disagree. Forces the planner to pick a stance per worker rather than averaging.</p>`,
+    extend: `<h4>Extend — working on a real codebase</h4>
+      <p>The workhorse mode. The planner sees a repo map and digests of the files you point at. It picks <em>by_file</em> when changes localise cleanly, <em>by_dimension</em> when many files need the same multi-axis review.</p>
+      <p>Workers each get only their declared <code class="inline">read_files</code>. Context budgets stay sane and the lens has a bundle to ground-check against.</p>`,
+    greenfield: `<h4>Greenfield — pure ideation</h4>
+      <p>No code, no references. Just a prompt and <em>N</em>. Default <em>by_hypothesis</em>: each worker explores a distinct approach. The reducer ranks or synthesises.</p>
+      <p class="footnote">Best for: "what could we even do here", "design a system that does X", early-stage research.</p>`
+  };
+
+  function applyMode(mode) {
+    currentMode = mode;
+    modeCards.forEach(c => c.classList.toggle('active', c.dataset.mode === mode));
+    modeContext.innerHTML = modeBlurb[mode];
+
+    const showRepo = mode === 'extend';
+    const showRefs = mode === 'extend' || mode === 'scratch';
+    repoInput.parentElement.style.opacity = showRepo ? 1 : 0.4;
+    repoInput.disabled = !showRepo;
+    filesInput.parentElement.style.opacity = showRepo ? 1 : 0.4;
+    filesInput.disabled = !showRepo;
+    refsInput.parentElement.style.opacity = showRefs ? 1 : 0.4;
+    refsInput.disabled = !showRefs;
+
+    runDemo();
+  }
+  modeCards.forEach(c => c.addEventListener('click', () => applyMode(c.dataset.mode)));
+
+  const nRange = document.getElementById('nRange');
+  const nVal = document.getElementById('nVal');
+  const nMap = [2, 4, 6, 8, 10];
+  function getN() { return nMap[parseInt(nRange.value, 10) - 1]; }
+  nRange.addEventListener('input', () => { nVal.textContent = getN(); runDemo(); });
+
+  const cmdInput = document.getElementById('cmdInput');
+  const planOut = document.getElementById('planOut');
+  const workerGrid = document.getElementById('workerGrid');
+  document.getElementById('runBtn').addEventListener('click', runDemo);
+  cmdInput.addEventListener('input', runDemo);
+  [repoInput, filesInput, refsInput].forEach(i => i.addEventListener('input', runDemo));
+
+  function pickStrategy(cmd, mode) {
+    const c = cmd.toLowerCase();
+    if (mode === 'greenfield') return 'by_hypothesis';
+    if (mode === 'scratch') {
+      if (/(brainstorm|explore|approach|option)/.test(c)) return 'by_hypothesis';
+      return 'by_phase';
+    }
+    if (/(audit|review|check|analyz)/.test(c) && /(security|perf|dx|access|quality|style)/.test(c)) return 'by_dimension';
+    if (/(refactor|migrate|rename|update|fix)/.test(c)) return 'by_file';
+    if (/(audit|review)/.test(c)) return 'by_dimension';
+    return 'by_file';
+  }
+
+  const DIMS = ["security","performance","DX","accessibility","code quality","test coverage","observability","docs","edge cases","i18n"];
+  const PHASES = ["research existing solutions","design API + data model","scaffold code structure","implement core logic","wire integration tests","write docs + examples","polish CLI ergonomics","performance pass","security pass","release checklist"];
+  const HYPOS = ["minimal viable approach","library-heavy approach","hand-rolled from primitives","event-driven architecture","functional approach","DSL-based approach","ML-assisted approach","hybrid local+remote","cache-first design","stateless design"];
+
+  function fakeFiles(globs, n) {
+    if (!globs.trim()) return [];
+    const stems = globs.trim().split(/\s+/).flatMap(g => {
+      const base = g.replace(/\*\*\/?\*?\.?\w*/g, '').replace(/\/$/, '');
+      const ext = (g.match(/\.\w+$/) || ['.py'])[0];
+      return [
+        base + '/middleware' + ext,
+        base + '/tokens' + ext,
+        base + '/session' + ext,
+        base + '/policies' + ext,
+        base + '/handlers' + ext,
+        base + '/utils' + ext,
+        base + '/models' + ext,
+        base + '/validators' + ext,
+      ];
+    });
+    return stems.slice(0, Math.max(n * 2, 4));
+  }
+
+  function buildPlan(cmd, n, mode) {
+    const strategy = pickStrategy(cmd, mode);
+    const refs = (refsInput.value || '').trim().split(/\s+/).filter(Boolean);
+    const filePool = mode === 'extend' ? fakeFiles(filesInput.value, n) : [];
+    const subtasks = [];
+
+    let pool;
+    if (strategy === 'by_dimension') pool = DIMS;
+    else if (strategy === 'by_phase') pool = PHASES;
+    else if (strategy === 'by_hypothesis') pool = HYPOS;
+    else pool = null;
+
+    for (let i = 0; i < n; i++) {
+      let title, instructions, read_files = [];
+      if (strategy === 'by_file') {
+        const slice = filePool.slice(i * 2, i * 2 + 2);
+        title = slice[0] ? slice[0].split('/').slice(-2).join('/') : `slice-${i+1}`;
+        instructions = `Apply "${cmd}" to the listed files only. Do not read or modify other paths.`;
+        read_files = slice;
+      } else {
+        const lens = pool[i % pool.length];
+        title = lens;
+        if (strategy === 'by_dimension') {
+          instructions = `Review against the "${lens}" lens. Output: ranked findings with file:line references and severity.`;
+          read_files = filePool.slice(0, Math.min(4, filePool.length));
+        } else if (strategy === 'by_phase') {
+          instructions = `Phase: ${lens}. Produce the artifact this phase owns. Assume earlier phases are done.`;
+        } else {
+          instructions = `Approach: ${lens}. Design + sketch implementation under this constraint. State tradeoffs.`;
+        }
+      }
+      subtasks.push({
+        id: i + 1,
+        title,
+        instructions,
+        read_files,
+        refs: refs.slice(0, 1),
+        expected_output: "markdown report"
+      });
+    }
+
+    return { n, mode, strategy, subtasks, merge_plan: strategy === 'by_hypothesis' ? 'rank' : 'synthesize' };
+  }
+
+  function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+  function renderWorkerGrid(plan) {
+    workerGrid.innerHTML = '';
+    plan.subtasks.forEach(s => {
+      const w = document.createElement('div');
+      w.className = 'worker';
+      const files = s.read_files && s.read_files.length
+        ? `<div class="wfiles">reads: ${s.read_files.join(', ')}</div>` : '';
+      w.innerHTML = `
+        <div class="wtitle">W${s.id} — ${escapeHtml(s.title)}</div>
+        <div class="winstr">${escapeHtml(s.instructions)}</div>
+        ${files}`;
+      workerGrid.appendChild(w);
+    });
+  }
+
+  function runDemo() {
+    const cmd = (cmdInput.value || '').trim() || '(no command)';
+    const n = getN();
+    const plan = buildPlan(cmd, n, currentMode);
+    planOut.textContent = JSON.stringify(plan, null, 2);
+    renderWorkerGrid(plan);
+  }
+
+  applyMode('extend');
+  nRange.value = 2; nVal.textContent = getN();
+  runDemo();
+})();
+</script>
+
+</body>
+</html>
