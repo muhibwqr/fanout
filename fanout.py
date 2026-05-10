@@ -16,8 +16,10 @@ from context import build_bundle
 from prompts import (
     INTENT_QUESTIONS_SYSTEM,
     INTENT_REFINE_SYSTEM,
+    LENS_AUDITOR_REDUCER_SYSTEM,
     PLANNER_SYSTEM,
     REDUCER_SYSTEM,
+    WORKER_LENS_INSTRUCTION,
     planner_schema,
 )
 from workers import (
@@ -481,10 +483,9 @@ async def run_worker(
     repo: Optional[str],
     *,
     timeout: float = 600.0,
+    lens: bool = False,
 ) -> dict:
-    needed = [f for f in bundle.get("files", []) if f["path"] in sub.get("read_files", [])]
-    worker_ctx = {"files": needed, "refs": sub.get("refs", [])}
-    prompt = json.dumps({"task": sub, "context": worker_ctx}, indent=2)
+    prompt = _build_worker_prompt(sub, bundle, lens=lens)
     out = await call_claude(prompt, cwd=repo, timeout=timeout)
     return {
         "id": sub["id"],
@@ -501,15 +502,116 @@ async def reduce_(command: str, plan_dict: dict, results: List[dict]) -> str:
     return await call_claude(payload, system=REDUCER_SYSTEM)
 
 
-def _build_worker_prompt(sub: dict, bundle: dict) -> str:
+async def auditor_reduce(
+    command: str, plan_dict: dict, bundle: dict, lens_report, *, strict: bool = False
+) -> str:
+    """Reducer that consumes a LensReport. Filters low-trust if --lens-strict."""
+    from dataclasses import asdict as _asdict
+
+    from lens import LensReport  # noqa: F401
+
+    high = [_asdict(c) for c in lens_report.high_trust]
+    med = [_asdict(c) for c in lens_report.med_trust]
+    low = [] if strict else [_asdict(c) for c in lens_report.low_trust]
+    suspect = [] if strict else [_asdict(c) for c in lens_report.suspect]
+    workers = [_asdict(w) for w in lens_report.workers]
+    scores_by_id = {k: _asdict(v) for k, v in lens_report.scores.items()}
+
+    payload = json.dumps(
+        {
+            "command": command,
+            "plan": plan_dict,
+            "high_trust": high,
+            "med_trust": med,
+            "low_trust": low,
+            "suspect": suspect,
+            "workers": workers,
+            "scores": scores_by_id,
+        },
+        indent=2,
+    )
+    return await call_claude(payload, system=LENS_AUDITOR_REDUCER_SYSTEM)
+
+
+async def lens_retry_flagged(args, p, bundle, lens_report):
+    """Re-dispatch flagged workers with steering instruction. One retry per worker."""
+    from lens import lens_pass
+
+    flagged_ids = [w.worker_id for w in lens_report.workers if w.flagged_for_retry]
+    if not flagged_ids:
+        return lens_report
+
+    print(
+        f"[fanout] lens-retry: re-running flagged workers {flagged_ids}", file=sys.stderr
+    )
+    flagged_subs = [s for s in p["subtasks"] if s["id"] in flagged_ids]
+    steered_plan = {**p, "subtasks": []}
+    for s in flagged_subs:
+        steered = dict(s)
+        steered["instructions"] = (
+            "[LENS RETRY — your previous output was flagged as low-grounding-density. "
+            "Re-do the task. For every specific claim, cite an exact file:line from "
+            "the read_files. Do not theorize. If you cannot ground a claim, omit it.] "
+            + s["instructions"]
+        )
+        steered_plan["subtasks"].append(steered)
+
+    coros = [
+        run_worker(s, bundle, args.repo, timeout=args.timeout, lens=True)
+        for s in steered_plan["subtasks"]
+    ]
+    retry_outputs = await asyncio.gather(*coros, return_exceptions=True)
+    retry_results = []
+    for s, out in zip(steered_plan["subtasks"], retry_outputs):
+        if isinstance(out, Exception):
+            retry_results.append(
+                {
+                    "id": s["id"],
+                    "title": s["title"],
+                    "output": f"[ERROR] retry failed: {out}",
+                    "error": True,
+                }
+            )
+        else:
+            retry_results.append(out)
+
+    fresh_report = await lens_pass(
+        p, bundle, retry_results, skip_reconstruction=getattr(args, "lens_fast", False)
+    )
+    # Merge: replace flagged workers with fresh entries.
+    keep_workers = [w for w in lens_report.workers if w.worker_id not in flagged_ids]
+    keep_claims = [c for c in lens_report.claims if c.worker_id not in flagged_ids]
+    keep_scores = {
+        k: v
+        for k, v in lens_report.scores.items()
+        if all(not k.startswith(f"W{wid}-") for wid in flagged_ids)
+    }
+    lens_report.workers = keep_workers + fresh_report.workers
+    lens_report.claims = keep_claims + fresh_report.claims
+    keep_scores.update(fresh_report.scores)
+    lens_report.scores = keep_scores
+    from lens import bucket_claims as _bucket
+
+    high, med, low, suspect = _bucket(lens_report.claims, lens_report.scores)
+    lens_report.high_trust = high
+    lens_report.med_trust = med
+    lens_report.low_trust = low
+    lens_report.suspect = suspect
+    return lens_report
+
+
+def _build_worker_prompt(sub: dict, bundle: dict, *, lens: bool = False) -> str:
     needed = [f for f in bundle.get("files", []) if f["path"] in sub.get("read_files", [])]
     worker_ctx = {"files": needed, "refs": sub.get("refs", [])}
-    return json.dumps({"task": sub, "context": worker_ctx}, indent=2)
+    payload = {"task": sub, "context": worker_ctx}
+    if lens:
+        payload["lens_instruction"] = WORKER_LENS_INSTRUCTION
+    return json.dumps(payload, indent=2)
 
 
 async def _dispatch_headless(args, p, bundle):
     print(f"[fanout] dispatching {len(p['subtasks'])} workers (headless)...", file=sys.stderr)
-    coros = [run_worker(s, bundle, args.repo, timeout=args.timeout) for s in p["subtasks"]]
+    coros = [run_worker(s, bundle, args.repo, timeout=args.timeout, lens=getattr(args, "lens", False)) for s in p["subtasks"]]
     raw_results = await asyncio.gather(*coros, return_exceptions=True)
     results: List[dict] = []
     failed = 0
@@ -531,7 +633,7 @@ async def _dispatch_headless(args, p, bundle):
 
 async def _dispatch_tmux(args, p, bundle):
     print(f"[fanout] dispatching {len(p['subtasks'])} workers (tmux)...", file=sys.stderr)
-    prompts = [_build_worker_prompt(s, bundle) for s in p["subtasks"]]
+    prompts = [_build_worker_prompt(s, bundle, lens=getattr(args, "lens", False)) for s in p["subtasks"]]
     info = dispatch_tmux(prompts, cwd=args.repo)
     session = info["session"]
     print(f"[fanout] tmux session: {session}", file=sys.stderr)
@@ -625,6 +727,30 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--keep-tmux",
         action="store_true",
         help="Don't kill the tmux session after workers complete. Useful for inspection.",
+    )
+    ap.add_argument(
+        "--lens",
+        action="store_true",
+        help="Run NLA-grounded quality filter on worker outputs before reducing.",
+    )
+    ap.add_argument(
+        "--lens-retry",
+        action="store_true",
+        help="Re-run any worker the lens flags as fake-success (one retry max).",
+    )
+    ap.add_argument(
+        "--lens-strict",
+        action="store_true",
+        help="With --lens: drop low-trust claims entirely (default is to surface in Suspect).",
+    )
+    ap.add_argument(
+        "--lens-report",
+        help="With --lens: write the full LensReport JSON to this path.",
+    )
+    ap.add_argument(
+        "--lens-fast",
+        action="store_true",
+        help="Skip the per-claim reconstruction LLM call (cheaper; relies on ground-check + recurrence only).",
     )
     return ap.parse_args(argv)
 
@@ -755,6 +881,51 @@ async def _main(args: argparse.Namespace) -> int:
         for r in results:
             print(f"\n=== W{r['id']} — {r['title']} ===\n")
             print(r["output"])
+        return 0 if failed == 0 else 3
+
+    if getattr(args, "lens", False):
+        print("[fanout] running lens pass...", file=sys.stderr)
+        from dataclasses import asdict as _asdict
+
+        from lens import lens_pass, report_to_dict
+
+        try:
+            lens_report = await lens_pass(
+                p, bundle, results, skip_reconstruction=getattr(args, "lens_fast", False)
+            )
+        except (BackendError, BackendTimeout) as e:
+            print(f"[fanout] lens pass failed: {e}", file=sys.stderr)
+            return 3
+        for w in lens_report.workers:
+            print(
+                f"[lens] W{w.worker_id} '{w.title[:40]}' high={w.high_count} "
+                f"med={w.med_count} low={w.low_count} fake_success={w.fake_success_score} "
+                f"flagged={'YES' if w.flagged_for_retry else 'no'}",
+                file=sys.stderr,
+            )
+        if getattr(args, "lens_retry", False):
+            try:
+                lens_report = await lens_retry_flagged(args, p, bundle, lens_report)
+            except (BackendError, BackendTimeout) as e:
+                print(f"[fanout] lens retry failed: {e}", file=sys.stderr)
+        if getattr(args, "lens_report", None):
+            pathlib.Path(args.lens_report).write_text(
+                json.dumps(report_to_dict(lens_report), indent=2)
+            )
+            print(f"[fanout] lens report → {args.lens_report}", file=sys.stderr)
+        print("[fanout] auditor-reducing...", file=sys.stderr)
+        try:
+            final = await auditor_reduce(
+                args.command,
+                p,
+                bundle,
+                lens_report,
+                strict=getattr(args, "lens_strict", False),
+            )
+        except (BackendError, BackendTimeout) as e:
+            print(f"[fanout] auditor-reducer failed: {e}", file=sys.stderr)
+            return 3
+        print(final)
         return 0 if failed == 0 else 3
 
     print("[fanout] reducing...", file=sys.stderr)

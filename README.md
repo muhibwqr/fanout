@@ -92,6 +92,11 @@ Three modes; pick whichever fits the work.
 | `--no-intent` | Skip the intent Q&A only; plan gate still shown. |
 | `--no-tmux` | Force headless `asyncio.gather` dispatch. |
 | `--keep-tmux` | Don't kill the tmux session after workers finish — useful for inspection. |
+| `--lens` | NLA-grounded quality filter between workers and reducer. Buckets claims by specificity, ground-checks file:line, counts recurrence, reconstruction-verifies, scores each claim High/Med/Low. Replaces reducer with an auditor reducer that emits Findings / Details / Suspect / Worker-reliability sections. |
+| `--lens-retry` | Re-run any worker the lens flags as fake-success (one retry max, with steering: "ground every specific in a cited file:line, do not theorize"). |
+| `--lens-strict` | Drop low-trust claims instead of surfacing in Suspect. |
+| `--lens-report <path>` | Write the full LensReport JSON to disk for inspection / replay. |
+| `--lens-fast` | Skip per-claim reconstruction LLM call; cheaper but weaker filter. |
 
 ## Exit codes
 
@@ -136,6 +141,23 @@ Per Anthropic's Natural Language Autoencoders work, LLM verbalisations are *them
 - Trust planner's *strategy* and *titles* (themes).
 - Don't trust planner's *file paths* — `_check_files_in_bundle` rejects hallucinated paths.
 - The planner is invoked with `--json-schema`, locking thematic fields to enums while leaving free-form `instructions` open.
+
+## Lens mode (v2) — killing fake-success worker outputs
+
+`--lens` adds an eight-stage quality filter between worker dispatch and the reducer, applying the NLA paper's heuristics at the API level:
+
+1. Extract atomic claims from each worker (Claude judge).
+2. Bucket each claim as `theme` / `entity` / `detail`.
+3. Ground-check cited paths and lines against the bundle.
+4. Count recurrence within-worker + across-workers (Jaccard ≥ 0.4).
+5. Reconstruction: ask Claude "is this claim supported by cited content?".
+6. Score each claim → `high` / `med` / `low` trust.
+7. Score each worker → `fake_success_score`, `flagged_for_retry`.
+8. Emit `LensReport`; auditor-reducer produces a four-section report (Findings / Details / Suspect / Worker reliability).
+
+Why: at N≥4, some workers produce plausible-looking but mediocre output. The lens filters specifics that don't ground in the bundle, surfaces themes that recur across workers as high-trust, and flags workers whose output reads like an audit but cites no real code.
+
+Read the full design + flow chart in `multi_agent_fanout.html` Section XIV.
 
 ## Limits (v0)
 
