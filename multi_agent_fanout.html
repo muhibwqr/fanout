@@ -352,7 +352,7 @@ settings:
   <li><b>Drift daemon.</b> Opt-in launchd job that runs <code class="inline">state diff</code> hourly and notifies. v4.</li>
   <li><b>Encrypted secrets.</b> 1Password CLI integration for tokens at apply time. v5.</li>
   <li><b>Module marketplace.</b> Shareable <code class="inline">.fanout</code> modules. v5.</li>
-  <li><b>True parallelism in apply.</b> v3 runs adapters sequentially; v4 will dispatch via tmux panes (the infra already exists in <code class="inline">workers.py</code> from fanout's prior life).</li>
+  <li><b>True parallelism in apply.</b> Shipped in v3.1 via <code class="inline">fanout apply --tmux</code> — one pane per adapter batch, live progress side by side.</li>
 </ul>
 
 <hr>

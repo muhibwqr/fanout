@@ -472,6 +472,156 @@ def render_ai(description: str, yaml_text: str, *, accepted: bool) -> str:
     return _shell("ai — generated manifest", body, byline="fanout ai")
 
 
+def render_task_plan(task: str, plan_markdown: str) -> str:
+    """Claude-generated developer-setup plan rendered as HTML.
+
+    The title is fixed: 'Project Fanout: Launching your Developer Setup Effectively'.
+    The body is a light markdown→HTML conversion of Claude's response.
+    """
+    body = (
+        f'<p class="byline">task: <code class="inline">{html.escape(task)}</code></p>'
+        f'{_md_to_html(plan_markdown)}'
+        '<hr>'
+        '<p class="footnote">Next: edit <code class="inline">~/.fanout/workstation.yml</code> '
+        'to incorporate the recommended additions, then run <code class="inline">fanout plan</code> '
+        '(no args) to see the diff, then <code class="inline">fanout apply</code> to converge.</p>'
+    )
+    return _shell(
+        "Project Fanout: Launching your Developer Setup Effectively",
+        body,
+        byline="fanout plan",
+    )
+
+
+def _md_to_html(md: str) -> str:
+    """Light markdown converter — handles headings, lists, code fences, code spans, bold/italic, paragraphs.
+
+    Intentionally minimal. Avoids external dependency. Good enough for Claude's
+    well-structured output following PLAN_TASK_SYSTEM.
+    """
+    import re
+
+    lines = md.splitlines()
+    out: List[str] = []
+    in_code = False
+    code_lang = ""
+    code_buf: List[str] = []
+    list_open = False
+    olist_open = False
+    para_buf: List[str] = []
+
+    def flush_para():
+        if para_buf:
+            text = " ".join(para_buf).strip()
+            if text:
+                out.append(f"<p>{_inline_md(text)}</p>")
+            para_buf.clear()
+
+    def close_lists():
+        nonlocal list_open, olist_open
+        if list_open:
+            out.append("</ul>")
+            list_open = False
+        if olist_open:
+            out.append("</ol>")
+            olist_open = False
+
+    for raw in lines:
+        line = raw.rstrip()
+
+        # code fence
+        if line.startswith("```"):
+            if not in_code:
+                flush_para()
+                close_lists()
+                in_code = True
+                code_lang = line[3:].strip()
+                code_buf = []
+            else:
+                escaped = html.escape("\n".join(code_buf))
+                out.append(f"<pre>{escaped}</pre>")
+                in_code = False
+                code_lang = ""
+                code_buf = []
+            continue
+        if in_code:
+            code_buf.append(raw)
+            continue
+
+        if not line.strip():
+            flush_para()
+            close_lists()
+            continue
+
+        # Headings
+        m = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if m:
+            flush_para()
+            close_lists()
+            level = len(m.group(1))
+            content = _inline_md(m.group(2))
+            tag = f"h{min(level + 1, 6)}"  # bump down so the doc title stays h1
+            out.append(f"<{tag}>{content}</{tag}>")
+            continue
+
+        # Ordered list
+        m = re.match(r"^\s*(\d+)\.\s+(.*)$", line)
+        if m:
+            flush_para()
+            if list_open:
+                out.append("</ul>")
+                list_open = False
+            if not olist_open:
+                out.append("<ol>")
+                olist_open = True
+            out.append(f"<li>{_inline_md(m.group(2))}</li>")
+            continue
+
+        # Unordered list
+        m = re.match(r"^\s*[-*+]\s+(.*)$", line)
+        if m:
+            flush_para()
+            if olist_open:
+                out.append("</ol>")
+                olist_open = False
+            if not list_open:
+                out.append("<ul>")
+                list_open = True
+            out.append(f"<li>{_inline_md(m.group(1))}</li>")
+            continue
+
+        # Paragraph buffer
+        para_buf.append(line)
+
+    flush_para()
+    close_lists()
+    if in_code:
+        escaped = html.escape("\n".join(code_buf))
+        out.append(f"<pre>{escaped}</pre>")
+    return "\n".join(out)
+
+
+def _inline_md(text: str) -> str:
+    """Inline markdown: escape HTML, then re-apply code spans, bold, italic, links."""
+    import re
+
+    # Escape first.
+    s = html.escape(text)
+    # Code spans  `code`
+    s = re.sub(r"`([^`]+)`", lambda m: f'<code class="inline">{m.group(1)}</code>', s)
+    # Bold  **text**
+    s = re.sub(r"\*\*([^*]+)\*\*", lambda m: f"<b>{m.group(1)}</b>", s)
+    # Italic  *text*  (avoid clobbering already-bolded)
+    s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", lambda m: f"<em>{m.group(1)}</em>", s)
+    # Links  [text](url)
+    s = re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        lambda m: f'<a href="{m.group(2)}" style="color: var(--accent); border-bottom: 1px solid var(--accent); text-decoration: none;">{m.group(1)}</a>',
+        s,
+    )
+    return s
+
+
 def render_claude(task_outputs: List[dict]) -> str:
     parts = [
         '<div class="summary">'

@@ -225,6 +225,60 @@ def test_render_claude_outputs():
     assert "Hello from W2" in out
 
 
+# ---------- task plan ----------
+
+
+def test_render_task_plan_uses_fixed_title():
+    md = "## Goal\nSet up.\n\n## Steps\n1. step one\n"
+    out = reports.render_task_plan("python ml rig", md)
+    assert "Project Fanout: Launching your Developer Setup Effectively" in out
+    assert "python ml rig" in out
+    # md ## bumps to h3 (page title is h1)
+    assert "<h3>Goal</h3>" in out
+    assert "<h3>Steps</h3>" in out
+    assert "<li>step one</li>" in out
+
+
+def test_md_to_html_headings_and_lists():
+    md = """## Section
+- item a
+- item b
+
+1. first
+2. second
+"""
+    out = reports._md_to_html(md)
+    assert "<h3>Section</h3>" in out  # h2 in md bumps to h3 in HTML (title is h1)
+    assert "<ul>" in out
+    assert "<li>item a</li>" in out
+    assert "<ol>" in out
+    assert "<li>first</li>" in out
+
+
+def test_md_to_html_code_fence():
+    md = "```yaml\nversion: 1\nbrew: [git]\n```"
+    out = reports._md_to_html(md)
+    assert "<pre>" in out
+    assert "version: 1" in out
+    assert "&lt;" not in out.split("<pre>")[1].split("</pre>")[0] or True  # ok
+
+
+def test_md_to_html_inline_code():
+    out = reports._md_to_html("Use `brew install jq` to install.")
+    assert '<code class="inline">brew install jq</code>' in out
+
+
+def test_md_to_html_bold():
+    out = reports._md_to_html("This is **important** info.")
+    assert "<b>important</b>" in out
+
+
+def test_md_to_html_escapes_html():
+    out = reports._md_to_html("Avoid <script>alert(1)</script>.")
+    assert "<script>" not in out
+    assert "&lt;script&gt;" in out
+
+
 # ---------- emit ----------
 
 

@@ -58,9 +58,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     sub.add_parser("edit", help="Open manifest in $EDITOR.")
 
-    p_plan = sub.add_parser("plan", help="Show diff: manifest vs installed.")
+    p_plan = sub.add_parser(
+        "plan",
+        help='Diff manifest vs installed, OR pass a task ("set up Python ML rig") to ask Claude for a plan.',
+    )
+    p_plan.add_argument(
+        "task",
+        nargs="?",
+        default=None,
+        help='Optional task description. If given, Claude writes a concise plan; if omitted, runs manifest diff.',
+    )
     p_plan.add_argument("--profile", default="default")
     p_plan.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
+    p_plan.add_argument("--timeout", type=float, default=300.0, help="Claude call timeout for task plans.")
     _add_html_flags(p_plan)
 
     p_apply = sub.add_parser("apply", help="Converge state to manifest.")
@@ -69,6 +79,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_apply.add_argument("--dry-run", action="store_true")
     p_apply.add_argument("--no-snapshot", action="store_true")
     p_apply.add_argument("--yes", action="store_true", help="Skip confirmation prompt.")
+    p_apply.add_argument(
+        "--tmux",
+        action="store_true",
+        help="Dispatch each adapter batch to its own tmux pane in parallel (visible install progress).",
+    )
+    p_apply.add_argument(
+        "--keep-tmux",
+        action="store_true",
+        help="Don't kill the tmux session after apply finishes (for inspection).",
+    )
     _add_html_flags(p_apply)
 
     p_state = sub.add_parser("state", help="Show owned items.")
@@ -188,12 +208,64 @@ def cmd_edit(args) -> int:
 
 
 def cmd_plan(args) -> int:
+    # Task-plan mode: Claude generates a markdown plan, render to HTML titled
+    # "Project Fanout: Launching your Developer Setup Effectively".
+    if args.task:
+        return _cmd_plan_task(args)
+    # Diff mode: existing manifest-vs-installed.
     manifest = _load_manifest(args.manifest)
     p = engine.compute_plan(manifest, args.profile)
     print(engine.render_plan(p))
     if getattr(args, "html", True):
         html_text = reports.render_plan(args.profile, p)
         path = reports.emit("plan", html_text, open_browser=getattr(args, "open_browser", True))
+        print(f"\n[fanout] report: {path}", file=sys.stderr)
+    return 0
+
+
+def _cmd_plan_task(args) -> int:
+    """Launch Claude to write a concise plan for the user's task; render HTML."""
+    from prompts import PLAN_TASK_SYSTEM
+    from workers import call_claude, parse_claude_envelope
+
+    current_manifest = None
+    mpath = pathlib.Path(args.manifest)
+    if mpath.exists():
+        current_manifest = mpath.read_text()
+
+    print(f"[fanout plan] asking Claude to plan: {args.task!r}", file=sys.stderr)
+    payload = json.dumps(
+        {
+            "task": args.task,
+            "current_manifest_yaml": current_manifest or "(none — user has not run `fanout init` yet)",
+            "available_adapters": ["brew", "cask", "npm_global", "pip", "curl"],
+        },
+        indent=2,
+    )
+    try:
+        raw = asyncio.run(
+            call_claude(payload, system=PLAN_TASK_SYSTEM, timeout=args.timeout)
+        )
+    except Exception as e:
+        print(f"[fanout plan] Claude call failed: {e}", file=sys.stderr)
+        return 3
+    plan_md = parse_claude_envelope(raw).strip()
+
+    # Strip code fences if Claude wrapped despite instruction.
+    if plan_md.startswith("```"):
+        lines = plan_md.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        plan_md = "\n".join(lines)
+
+    print(plan_md)
+    if getattr(args, "html", True):
+        html_text = reports.render_task_plan(args.task, plan_md)
+        path = reports.emit(
+            "task-plan", html_text, open_browser=getattr(args, "open_browser", True)
+        )
         print(f"\n[fanout] report: {path}", file=sys.stderr)
     return 0
 
@@ -219,11 +291,20 @@ def cmd_apply(args) -> int:
             return 0
 
     s = state_mod.load()
-    result = engine.apply_plan(
-        p, s, state_dir=DEFAULT_DIR,
-        snapshot_before=(not args.no_snapshot) and (not args.dry_run),
-        dry_run=args.dry_run,
-    )
+    if getattr(args, "tmux", False) and not args.dry_run:
+        result = engine.apply_plan_tmux(
+            p,
+            s,
+            state_dir=DEFAULT_DIR,
+            snapshot_before=(not args.no_snapshot),
+            keep_session=getattr(args, "keep_tmux", False),
+        )
+    else:
+        result = engine.apply_plan(
+            p, s, state_dir=DEFAULT_DIR,
+            snapshot_before=(not args.no_snapshot) and (not args.dry_run),
+            dry_run=args.dry_run,
+        )
     _print_logs(result.logs)
 
     print("\n[apply summary]", file=sys.stderr)

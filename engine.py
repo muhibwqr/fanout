@@ -105,7 +105,11 @@ def apply_plan(
     snapshot_before: bool = True,
     dry_run: bool = False,
 ) -> ApplyResult:
-    """Execute the plan. For v0 runs adapters sequentially. tmux dispatch is in fanout.py."""
+    """Execute the plan sequentially per adapter.
+
+    Parallel tmux-paneled dispatch lives in `apply_plan_tmux()`. Both routes
+    share the same diff input + state mutation + ApplyResult shape.
+    """
     reg = registry or ad.build_registry()
     result = ApplyResult(ok=True)
 
@@ -292,3 +296,206 @@ def drift_check(state: State, registry: Optional[Dict[str, Adapter]] = None) -> 
     reg = registry or ad.build_registry()
     actual: Dict[str, Set[str]] = {b: reg[b].list_installed() for b in ADAPTER_BUCKETS}
     return state_mod.drift(state, actual)
+
+
+# ---------------------------------------------------------------------------
+# Tmux-paneled parallel apply
+# ---------------------------------------------------------------------------
+
+
+def apply_plan_tmux(
+    plan: PlanResult,
+    state: State,
+    *,
+    state_dir: Optional[pathlib.Path] = None,
+    snapshot_before: bool = True,
+    keep_session: bool = False,
+    timeout: float = 1800.0,
+) -> ApplyResult:
+    """Apply the plan with one tmux pane per adapter batch.
+
+    Each pane runs the adapter's install command (e.g. `brew install A B C`)
+    in parallel. Output is captured per pane via tee; we poll sentinel files.
+    Falls back to sequential `apply_plan` if tmux is unavailable.
+    """
+    import asyncio
+    import shlex
+    import workers
+
+    if not workers.tmux_available():
+        result = apply_plan(
+            plan, state, state_dir=state_dir,
+            snapshot_before=snapshot_before, dry_run=False,
+        )
+        result.logs.insert(0, "[engine] tmux not on PATH; ran sequentially")
+        return result
+
+    reg = ad.build_registry()
+    curl_items_desired = plan.bucket_diffs.get("curl", {}).get("install", [])
+    if isinstance(reg["curl"], ad.CurlAdapter):
+        reg["curl"].register(curl_items_desired)
+
+    result = ApplyResult(ok=True)
+    if plan.nothing_to_do:
+        return result
+
+    if snapshot_before:
+        snap = state_mod.snapshot(state, state_dir, label=f"pre-apply-{plan.profile}")
+        result.snapshot_id = snap["id"]
+
+    # Build the shell command per adapter batch.
+    tasks: List[dict] = []
+    for bucket in ADAPTER_BUCKETS:
+        d = plan.bucket_diffs[bucket]
+        installs = d["install"]
+        removes = d["remove"]
+        if not installs and not removes:
+            continue
+        names_install = [c.name if isinstance(c, CurlItem) else c for c in installs]
+        names_remove = list(removes)
+
+        cmd = _build_adapter_shell_cmd(bucket, installs, removes)
+        if cmd is None:
+            continue
+        tasks.append(
+            {
+                "bucket": bucket,
+                "shell": cmd,
+                "names_install": names_install,
+                "names_remove": names_remove,
+            }
+        )
+
+    if not tasks:
+        return result
+
+    # Dispatch to tmux. workers.dispatch_tmux runs `claude -p "<prompt>"` per
+    # pane by default; we need raw shell, so we build per-pane shell commands
+    # and dispatch via a thin wrapper.
+    info = _dispatch_tmux_shells(
+        [t["shell"] for t in tasks],
+        labels=[t["bucket"] for t in tasks],
+    )
+    result.logs.append(f"[engine] tmux session: {info['session']}")
+    result.logs.append(f"  attach: tmux attach -t {info['session']}")
+    result.logs.append(f"  logs:   {info['run_dir']}/W*.out")
+
+    pane_outputs = asyncio.run(
+        workers.wait_for_done(info["pane_files"], poll_interval=2.0, timeout=timeout)
+    )
+
+    # Assemble per-task results. Naive: assume any non-error output means success.
+    for task, pane in zip(tasks, pane_outputs):
+        bucket = task["bucket"]
+        output = pane.get("output", "")
+        ok = not pane.get("error") and ("error" not in output.lower()[:200] or "0 vulnerabilities" in output.lower())
+        log_excerpt = output[-500:]
+        result.logs.append(f"[{bucket}] (tmux pane) {'OK' if ok else 'FAILED'}\n{log_excerpt}")
+        if ok:
+            if task["names_install"]:
+                result.installed.setdefault(bucket, []).extend(task["names_install"])
+                state.add_owned(bucket, task["names_install"])
+            if task["names_remove"]:
+                result.removed.setdefault(bucket, []).extend(task["names_remove"])
+                state.remove_owned(bucket, task["names_remove"])
+        else:
+            result.ok = False
+            result.failures.setdefault(bucket, []).extend(task["names_install"] + task["names_remove"])
+
+    if not keep_session:
+        workers.kill_tmux_session(info["session"])
+
+    state_mod.save(state, state_dir)
+    return result
+
+
+def _build_adapter_shell_cmd(
+    bucket: str, installs, removes
+) -> Optional[str]:
+    """Compose the raw shell command an adapter would run, for tmux dispatch."""
+    if bucket == "brew":
+        parts = []
+        if installs:
+            parts.append("brew install " + " ".join(installs))
+        if removes:
+            parts.append("brew uninstall --ignore-dependencies " + " ".join(removes))
+        return " && ".join(parts) if parts else None
+    if bucket == "cask":
+        parts = []
+        if installs:
+            parts.append("brew install --cask " + " ".join(installs))
+        if removes:
+            parts.append("brew uninstall --cask " + " ".join(removes))
+        return " && ".join(parts) if parts else None
+    if bucket == "npm_global":
+        parts = []
+        if installs:
+            parts.append("npm install -g " + " ".join(installs))
+        if removes:
+            parts.append("npm uninstall -g " + " ".join(removes))
+        return " && ".join(parts) if parts else None
+    if bucket == "pip":
+        parts = []
+        if installs:
+            parts.append("python3 -m pip install --user " + " ".join(installs))
+        if removes:
+            parts.append("python3 -m pip uninstall -y " + " ".join(removes))
+        return " && ".join(parts) if parts else None
+    if bucket == "curl":
+        # CurlItem entries: chain bash -c "<install>" per item.
+        steps = []
+        for c in installs:
+            # c is a CurlItem
+            steps.append(c.install)
+        if not steps:
+            return None
+        return " && ".join(f'( {s} )' for s in steps)
+    return None
+
+
+def _dispatch_tmux_shells(shells: list, labels: list) -> dict:
+    """Spawn one detached tmux session with one pane per raw shell command.
+
+    Mirrors workers.dispatch_tmux but invokes raw shell instead of claude -p.
+    """
+    import os
+    import pathlib
+    import shlex
+    import subprocess
+    import uuid
+
+    rid = uuid.uuid4().hex[:8]
+    session = f"fanout_apply_{rid}"
+    rd = pathlib.Path(f"/tmp/fanout_apply_{rid}")
+    rd.mkdir(parents=True, exist_ok=True)
+
+    pane_files = []
+    for i, (shell_cmd, label) in enumerate(zip(shells, labels), start=1):
+        prompt_file = rd / f"W{i}.prompt"
+        out_file = rd / f"W{i}.out"
+        done_file = rd / f"W{i}.done"
+        prompt_file.write_text(shell_cmd)
+        pane_files.append(
+            {"id": i, "prompt": str(prompt_file), "out": str(out_file), "done": str(done_file)}
+        )
+        wrapped = (
+            f"echo '=== W{i} {label} ==='; "
+            f"{shell_cmd} 2>&1 | tee {shlex.quote(str(out_file))}; "
+            f"echo \"exit=$?\" >> {shlex.quote(str(out_file))}; "
+            f"touch {shlex.quote(str(done_file))}; "
+            f"echo; echo '=== W{i} done. ctrl-b d to detach. ==='; sleep 86400"
+        )
+        if i == 1:
+            subprocess.run(
+                ["tmux", "new-session", "-d", "-s", session, "-n", "apply",
+                 "bash", "-c", wrapped],
+                check=True,
+            )
+        else:
+            subprocess.run(
+                ["tmux", "split-window", "-t", session, "bash", "-c", wrapped],
+                check=True,
+            )
+            subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=False)
+    subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=False)
+    return {"session": session, "run_dir": str(rd), "pane_files": pane_files}
