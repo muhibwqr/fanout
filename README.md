@@ -1,248 +1,129 @@
 # fanout
 
-> One YAML file. Five commands. Your dev machine, declarative, idempotent, rollback-able, with HTML reports.
-
-```sh
-fanout init                                  # write ~/.fanout/workstation.yml
-fanout plan "set up a Python ML rig"         # ask Claude for a setup plan (HTML)
-fanout plan                                  # diff manifest vs your machine (HTML)
-fanout apply --tmux                          # install in parallel tmux panes
-fanout rollback                              # undo last apply
-```
-
-Every command opens an HTML report in your browser. You stay in the loop. You can `Cmd+P` and find any past run in `~/.fanout/reports/`.
-
-Forked from [LeuAlmeida/workstation](https://github.com/LeuAlmeida/workstation) (MIT). Same tool inventory. Different fundamentals.
-
----
-
-## Why it exists
-
-Workstation, `dotbot`, every "set up my mac" repo on GitHub — they're shell scripts. They install 50 tools top-to-bottom. They have these problems:
-
-1. **Not idempotent.** Re-running re-installs. Output undefined.
-2. **No preview.** You can't see what they'll do before they do it.
-3. **No rollback.** Step 43 fails → wrecked machine.
-4. **No state.** Three months later, you can't tell what the script installed vs what you did.
-5. **No drift detection.** You install something off-script → next re-run clobbers your state.
-6. **No selection.** All-or-nothing. Want only AWS + Node? Fork and edit.
-7. **No verify.** Did `docker ps` actually work? You find out when you try to use it.
-
-`fanout` fixes all of that. The Terraform pattern (declarative spec → plan/apply/state) applied to your laptop.
-
----
-
-## Install (30 seconds)
+> Launch N parallel Claude agents in tmux panes. One bash command. No install.
 
 ```sh
 git clone https://github.com/muhibwqr/fanout
 cd fanout
 chmod +x run.sh
 ln -sf "$(pwd)/run.sh" ~/.local/bin/fanout
-python3 -m pip install --user pyyaml
 ```
 
-That's it. `python3` + `pyyaml` are the only runtime deps. `tmux` is optional but recommended.
+That's it. `~/.local/bin` is on most PATHs. If not, run `./run.sh` directly.
+
+Requires: `python3`, `claude` CLI on PATH, `tmux` (recommended; falls back to single-terminal headless if missing). No pip installs. No system packages. No `~/.fanout/` directory. Nothing to clean up.
 
 ---
 
-## How to use it
+## Two commands
 
-### Day one — declare what you want
+### `fanout claude N "prompt"`
 
-```sh
-fanout init
-```
-
-Writes `~/.fanout/workstation.yml` from a starter template. Open it:
+Launch N Claude sessions in N tmux panes side by side. Each one runs the same prompt:
 
 ```sh
-fanout edit
+fanout claude 2 "build a backend for a typing test app that will take tests and submit them"
 ```
 
-Edit it. Add the tools you want. The format is dead-simple YAML. A typical entry:
+Two panes spawn. Each runs `claude -p` with that exact prompt. You watch them work in parallel.
 
-```yaml
-version: 1
-
-profiles:
-  default: [base, web, cloud]
-
-modules:
-  base:
-    brew: [git, jq, ripgrep, fzf]
-  web:
-    brew: [node]
-    cask: [visual-studio-code]
-    npm_global: [typescript, yarn]
-  cloud:
-    brew: [awscli, kubectl]
-    cask: [docker]
-
-settings:
-  apply:
-    snapshot_before: true
-  verify:
-    checks:
-      - cmd: "git --version"
-      - cmd: "node --version"
-```
-
-Three things to know:
-- **Profiles** compose **modules**. Pick a profile with `--profile X`.
-- **Modules** group tools by **bucket** (which package manager handles them).
-- **Buckets** today: `brew`, `cask`, `npm_global`, `pip`, `curl`. Each is one adapter file.
-
-### Day one — see what would happen
+**Different prompts per pane** — pass exactly N prompts:
 
 ```sh
-fanout plan
+fanout claude 3 "design the schema" "write the API" "write the frontend"
 ```
 
-Opens an HTML report in your browser. `+green` = will install. `-red` = will uninstall (it's in your installed set but not in the manifest). `=muted` = unchanged.
+### `fanout plan "task description"`
 
-**This is the moment workstation taught us was missing.** You read the plan before any side effect happens. You change your mind. You edit the manifest. You re-plan. Then apply.
-
-### Day one — converge
+Don't know how to split the work? Let Claude decide. The orchestrator reads your task, decides how many agents, writes one prompt per agent, then launches them:
 
 ```sh
-fanout apply --tmux
+fanout plan "build a typing-test app with a Go backend, Postgres, and a React frontend"
 ```
 
-Snapshot taken before apply. Then one tmux pane per adapter batch: `brew install` in one pane, `npm install -g` in another, `pip install --user` in a third. You watch progress side by side. Pane stays open after; `ctrl-b d` to detach.
-
-If you don't want tmux:
-
-```sh
-fanout apply           # sequential, all in your current terminal
-fanout apply --dry-run # print the commands; don't run them
+Output:
+```
+[fanout plan] asking orchestrator to decompose...
+[fanout plan] N=4  rationale: split by stack layer for clean parallelism
+  W1: Design the Postgres schema for users, tests, submissions...
+  W2: Write a Go backend that serves the schema from W1...
+  W3: Write a React frontend that talks to the W2 API...
+  W4: Write deployment + docker-compose tying it together...
+[fanout] launching 4 panes (tmux)...
+[fanout] tmux session: fanout_a3b8c1
+  attach: tmux attach -t fanout_a3b8c1
 ```
 
-When it's done, HTML report opens. Snapshot id is in the report. You can `fanout rollback` from any future moment.
-
-### Day two — drift
-
-You install something off-manifest:
-
-```sh
-brew install httpie
-```
-
-Then:
-
-```sh
-fanout state diff
-```
-
-Exit code 2. HTML report opens listing the off-manifest install. Two choices:
-- Add `httpie` to a module in your manifest (then `fanout apply` is a no-op; state catches up).
-- Leave it off; `fanout apply` would uninstall it on the next run.
-
-### Day two — undo
-
-```sh
-fanout rollback
-```
-
-Restores the snapshot taken before the most recent apply. HTML report shows what was re-installed and what was removed.
-
-### Day N — AI mode
-
-You forgot what to add to your manifest. Ask Claude:
-
-```sh
-fanout plan "set up a Python ML rig with PyTorch and Jupyter"
-```
-
-Claude writes a concise HTML plan titled **Project Fanout: Launching your Developer Setup Effectively**. It tells you:
-- The goal restated in its own words
-- The strategy (which package managers, how many items)
-- 7-or-fewer numbered steps
-- The exact YAML to add to your manifest
-- Verification commands to run after `fanout apply`
-- Risks and callouts before you act
-
-Or generate the whole manifest:
-
-```sh
-fanout ai "set up a Python ML rig with PyTorch and Jupyter"
-```
-
-Claude writes the full `workstation.yml`. `[a]ccept / [e]dit / [r]egen / [q]uit`. On accept it writes the file. Then `fanout apply --tmux`.
+Add `--dry-run` to see the orchestrator's plan without launching.
 
 ---
 
-## Every command produces HTML
+## Paste a repo or context
 
-Inspired by Thariq's [Unreasonable Effectiveness of HTML](https://thariqs.github.io/html-effectiveness/).
+Include repo contents as preamble in every prompt:
 
-| Command | HTML report shows |
-|---------|-------------------|
-| `fanout plan` (no task) | Summary cards (+install / −remove / =keep), per-adapter buckets, color-coded items |
-| `fanout plan "task"` | Claude-generated setup plan with goal, strategy, steps, manifest additions, verification |
-| `fanout apply` | Snapshot id, installed/removed/failed sections, full log per bucket |
-| `fanout state` | Per-bucket ownership counts, item lists, snapshot history table |
-| `fanout state diff` | Drift cards, off-manifest installs, missing items with rationale |
-| `fanout verify` | Pass/fail per check, stderr capture on failures |
-| `fanout rollback` | Re-installed/removed sections, log capture |
-| `fanout ai "..."` | Generated manifest with accept status |
-| `fanout claude "..." "..."` | Aggregated worker output |
-
-Reports go to `~/.fanout/reports/<timestamp>-<cmd>.html`. Auto-open in browser. Add `--no-open` to suppress the browser, `--no-html` to skip the report entirely.
-
----
-
-## Why it's undeniable
-
-| | shell script | fanout |
-|---|---|---|
-| Source format | 40 KB of bash | ~70 lines of YAML |
-| Re-run safe? | No | Yes |
-| Preview before apply? | No | `fanout plan` |
-| Rollback after fail? | No | `fanout rollback` |
-| Tracks what it installed? | No | `~/.fanout/state.json` |
-| Detects drift? | No | `fanout state diff` |
-| Picks subset? | Fork & edit | `--profile X` |
-| Verifies install works? | No | `fanout verify` |
-| AI assistance? | No | `fanout plan "..."` and `fanout ai "..."` |
-| Visible parallel installs? | No | `fanout apply --tmux` |
-| HTML reports you can share? | No | Every command |
-| Adds a new package manager? | Edit the bash | One ~60 LOC `adapters/X.py` |
-| Test suite? | None | 67 unit tests |
-
-Every right-column cell answers a real failure of the left column.
-
----
-
-## Subcommand reference
-
-```
-fanout init [--from-workstation] [--force]      # create manifest from template
-fanout edit                                      # $EDITOR on the manifest
-fanout plan ["<task>"] [--profile X]             # diff (no task) or Claude plan (with task)
-fanout apply [--profile X] [--tmux] [--dry-run]  # converge
-fanout state                                     # show owned items
-fanout state diff                                # detect drift (exit 2 on drift)
-fanout verify                                    # run sanity checks
-fanout rollback [--dry-run]                      # restore last snapshot
-fanout ai "<prose description>"                  # Claude writes the manifest
-fanout claude "task a" "task b"                  # N parallel claude -p in tmux panes
+```sh
+fanout claude 4 "audit each module for security issues" --repo ~/work/my-api
+fanout plan "refactor this codebase to add caching" --repo .
 ```
 
-Universal flags (every command):
-- `--no-open` — write the HTML report but don't open the browser
-- `--no-html` — skip the HTML report entirely
+Or pipe arbitrary context via stdin:
+
+```sh
+git diff HEAD~5 | fanout plan "review this diff for regressions" --paste
+cat README.md | fanout claude 2 "rewrite this in two different voices" --paste
+```
+
+Repo packing skips `.git`, `node_modules`, binaries, oversized files. Caps the dump at ~400KB so it fits in the model's context cleanly.
 
 ---
 
-## Files this tool touches
+## Flags
 
-- `~/.fanout/workstation.yml` — your manifest. Edit freely.
-- `~/.fanout/state.json` — what fanout owns. Don't edit directly.
-- `~/.fanout/snapshots/<ts>.json` — rollback snapshots. Don't edit.
-- `~/.fanout/reports/<ts>-<cmd>.html` — HTML reports. Browse freely, share freely.
+Both `claude` and `plan` accept:
 
-Nothing else outside `~/.fanout/`.
+| Flag | Effect |
+|------|--------|
+| `--repo PATH` | Pack repo contents as preamble in every prompt. |
+| `--paste` | Read stdin and prepend to every prompt. |
+| `--no-tmux` | Run sequentially in this terminal (asyncio.gather). |
+| `--keep-tmux` | Don't kill the tmux session after panes finish. |
+| `--timeout SECONDS` | Per-pane wall-clock timeout. Default 600. |
+
+`plan` also has:
+- `-n N` — hint the orchestrator about desired count (still its decision).
+- `--dry-run` — print the plan; don't launch.
+
+---
+
+## How it works
+
+```
+              ┌────────────────────────────┐
+              │ fanout claude N "prompt"   │
+              └─────────────┬──────────────┘
+                            │
+              ┌─────────────▼──────────────┐
+              │ build N prompts            │
+              │ (optionally wrap in repo/  │
+              │  paste preamble)           │
+              └─────────────┬──────────────┘
+                            │
+              ┌─────────────▼──────────────┐
+              │ tmux new-session + N-1     │
+              │ split-windows; one pane    │
+              │ per claude -p invocation   │
+              └─────────────┬──────────────┘
+                            │
+              ┌─────────────▼──────────────┐
+              │ poll W*.done sentinels;    │
+              │ collect W*.out; print      │
+              │ aggregated output;         │
+              │ kill session (or keep).    │
+              └────────────────────────────┘
+```
+
+`fanout plan` adds one extra step at the front: a single `claude -p` call with an orchestrator system prompt that returns JSON `{n, rationale, tasks: [N prompts]}`. Then the dispatch is identical.
 
 ---
 
@@ -252,19 +133,31 @@ Nothing else outside `~/.fanout/`.
 python3 -m pytest -v
 ```
 
-67 unit tests across manifest, state, adapters, reports. Subprocess fully mocked. <1s.
+25 tests across argparse, repo packing, JSON extraction. Subprocess-free; <0.2s.
 
 ---
 
-## Attribution
+## Files
 
-Tool inventory in `manifests/workstation-port.yml` derived from
-[LeuAlmeida/workstation](https://github.com/LeuAlmeida/workstation) (MIT).
-See `NOTICE.md`.
+```
+fanout/
+  fanout.py          CLI: claude + plan subcommands, repo packing, dispatch
+  workers.py         tmux session/pane spawning, async claude wrapper
+  prompts.py         ORCHESTRATOR_SYSTEM (for `fanout plan`)
+  run.sh             entrypoint (resolves symlink, exec python)
+  tests/
+    test_fanout.py
+```
 
-HTML-first communication inspired by Thariq's
-[Unreasonable Effectiveness of HTML](https://thariqs.github.io/html-effectiveness/).
+Five source files. No config. No state. No reports directory.
+
+---
 
 ## License
 
 MIT.
+
+Inspired by the multi-agent dispatch pattern in
+[LeuAlmeida/workstation](https://github.com/LeuAlmeida/workstation) and
+the HTML communication style in
+[Thariq's html-effectiveness](https://thariqs.github.io/html-effectiveness/).

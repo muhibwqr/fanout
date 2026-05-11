@@ -3,21 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>fanout — declarative workstation bootstrap (a 10x fork of LeuAlmeida/workstation)</title>
+<title>fanout — N parallel Claude agents in tmux, one bash command</title>
 <style>
   :root {
     --bg: #f4ecd8;
-    --bg-soft: #ede4cd;
     --bg-card: #faf3e0;
     --ink: #1a1a1a;
     --ink-soft: #2a2722;
     --muted: #5a5650;
-    --dim: #8a857c;
     --rule: #d8cfb8;
     --rule-strong: #b8ad94;
     --accent: #7a3b2e;
-    --accent-soft: #a35d4d;
-    --accent2: #2c4a6b;
     --success: #3d6b3a;
     --danger: #963a2c;
   }
@@ -29,24 +25,28 @@
     line-height: 1.55;
     -webkit-font-smoothing: antialiased;
   }
-  main { max-width: 760px; margin: 0 auto; padding: 72px 28px 120px; }
+  main { max-width: 760px; margin: 0 auto; padding: 64px 28px 96px; }
 
-  header.hero { padding: 0 0 36px; border-bottom: 1px solid var(--rule); margin-bottom: 40px; }
-  h1 { font-weight: 600; font-size: 40px; line-height: 1.1; letter-spacing: -0.01em; margin: 0 0 18px; }
-  h2 { font-weight: 600; font-size: 26px; margin: 56px 0 14px; letter-spacing: -0.005em; }
-  h2 .num { color: var(--dim); font-weight: 400; margin-right: 12px; font-variant-numeric: oldstyle-nums; }
-  h3 { font-weight: 600; font-size: 19px; margin: 28px 0 10px; }
+  header.hero { padding: 0 0 28px; border-bottom: 1px solid var(--rule); margin-bottom: 36px; }
+  h1 { font-weight: 600; font-size: 38px; line-height: 1.1; letter-spacing: -0.01em; margin: 0 0 14px; }
+  h2 { font-weight: 600; font-size: 24px; margin: 48px 0 12px; }
+  h2 .num { color: var(--muted); font-weight: 400; margin-right: 12px; font-variant-numeric: oldstyle-nums; }
+  h3 { font-weight: 600; font-size: 18px; margin: 24px 0 8px; }
   p, li { color: var(--ink-soft); }
   .lead { font-size: 21px; line-height: 1.5; color: var(--ink); margin: 0; }
-  .byline { font-family: Arial, sans-serif; font-size: 12px; letter-spacing: 0.06em; color: var(--muted); text-transform: uppercase; margin: 18px 0 0; }
+  .byline { font-family: Arial, sans-serif; font-size: 12px; letter-spacing: 0.06em; color: var(--muted); text-transform: uppercase; margin: 14px 0 0; }
+  .tags { margin: 12px 0 0; font-family: Arial, sans-serif; font-size: 12px; color: var(--muted); letter-spacing: 0.04em; }
+  .tags span { margin-right: 14px; }
+  .tags span::before { content: "·"; margin-right: 6px; color: var(--rule-strong); }
+  .tags span:first-child::before { content: ""; margin: 0; }
 
-  nav.toc { border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); padding: 14px 0; margin: 0 0 40px; font-family: Arial, sans-serif; font-size: 12px; letter-spacing: 0.04em; color: var(--muted); }
+  nav.toc { border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); padding: 12px 0; margin: 0 0 36px; font-family: Arial, sans-serif; font-size: 12px; letter-spacing: 0.04em; color: var(--muted); }
   nav.toc a { color: var(--muted); text-decoration: none; margin-right: 18px; }
   nav.toc a:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
 
   ul, ol { padding-left: 24px; }
-  li { margin: 6px 0; }
-  hr { border: none; border-top: 1px solid var(--rule); margin: 56px 0; }
+  li { margin: 5px 0; }
+  hr { border: none; border-top: 1px solid var(--rule); margin: 48px 0; }
   em { font-style: italic; }
   strong, b { font-weight: 600; }
   .footnote { color: var(--muted); font-size: 14px; font-style: italic; }
@@ -56,11 +56,10 @@
     background: var(--bg-card);
     border: 1px solid var(--rule);
     border-radius: 4px;
-    padding: 16px 18px;
+    padding: 14px 16px;
     overflow-x: auto;
-    font-size: 13.5px;
-    line-height: 1.6;
-    color: var(--ink);
+    font-size: 13px;
+    line-height: 1.55;
   }
   code.inline {
     background: var(--bg-card);
@@ -71,292 +70,179 @@
     color: var(--accent);
   }
 
-  figure { margin: 24px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-family: Arial, sans-serif; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  thead th { border-bottom: 1px solid var(--ink); font-weight: 700; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+
+  figure { margin: 22px 0; }
   figure svg { display: block; max-width: 100%; height: auto; background: var(--bg-card); border: 1px solid var(--rule); border-radius: 4px; }
   figcaption { font-family: Arial, sans-serif; font-size: 12px; letter-spacing: 0.04em; color: var(--muted); margin-top: 8px; text-transform: uppercase; }
   svg text { font-family: Arial, sans-serif; fill: var(--ink); }
 
-  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-family: Arial, sans-serif; font-size: 14px; }
-  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
-  thead th { border-bottom: 1px solid var(--ink); font-weight: 700; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
-  td.num { font-family: "SF Mono", Menlo, monospace; }
-  td.bad { color: var(--danger); }
-  td.good { color: var(--success); }
-
-  .tags { margin: 18px 0 0; font-family: Arial, sans-serif; font-size: 12px; color: var(--muted); letter-spacing: 0.04em; }
-  .tags span { margin-right: 14px; }
-  .tags span::before { content: "·"; margin-right: 6px; color: var(--rule-strong); }
-  .tags span:first-child::before { content: ""; margin: 0; }
-
   .pull { border-left: 2px solid var(--accent); padding: 4px 0 4px 14px; margin: 22px 0; color: var(--ink); font-style: italic; font-size: 19px; }
 
-  .lead.drop::first-letter { font-size: 60px; line-height: 0.9; float: left; padding: 6px 10px 0 0; font-weight: 600; color: var(--accent); }
+  .lead.drop::first-letter { font-size: 58px; line-height: 0.9; float: left; padding: 4px 10px 0 0; font-weight: 600; color: var(--accent); }
 </style>
 </head>
 <body>
 <main>
 
 <header class="hero">
-  <p class="byline" style="margin: 0 0 14px;">fanout — declarative workstation bootstrap</p>
-  <h1>The 10x fork of <code style="font-size: 0.85em; background: var(--bg-card); padding: 2px 8px; border-radius: 3px; border: 1px solid var(--rule);">LeuAlmeida/workstation</code></h1>
-  <p class="lead drop">Workstation is one shell script and a prayer. fanout takes its tool inventory and wraps it in Terraform-for-laptop: a YAML manifest, a plan/apply engine, a state file, drift detection, rollback, and an AI mode that writes the manifest for you from prose. Same idea. Different fundamentals.</p>
-  <p class="byline">github.com/muhibwqr/fanout · forked from github.com/LeuAlmeida/workstation</p>
+  <p class="byline" style="margin: 0 0 12px;">fanout — multi-agent dispatch</p>
+  <h1>N parallel Claude agents in tmux, from one bash command</h1>
+  <p class="lead drop">A typing-test backend in one terminal. A frontend in the next. A schema in a third. All running at the same time, prompted by you (or by an orchestrator Claude), all visible side by side in tmux. That is the entire tool. No config files, no installer, no state directory. Clone the repo, symlink one script, type <code style="color:var(--accent);">fanout claude 4 "..."</code>, and four agents are working in parallel.</p>
+  <p class="byline">github.com/muhibwqr/fanout</p>
   <p class="tags">
-    <span>MIT-on-MIT</span><span>brew + cask + npm + pip + curl</span><span>macOS first</span><span>v3 shipped 2026-05-10</span>
+    <span>two subcommands</span><span>tmux + claude</span><span>no install</span><span>no state</span>
   </p>
 </header>
 
 <nav class="toc">
-  <a href="#error">The error</a>
-  <a href="#fix">The fix</a>
-  <a href="#arch">Architecture</a>
-  <a href="#compare">Workstation vs fanout</a>
-  <a href="#cli">CLI</a>
-  <a href="#manifest">Manifest</a>
-  <a href="#ai">AI mode</a>
-  <a href="#html">HTML reports</a>
-  <a href="#limits">Limits</a>
+  <a href="#use">Use</a>
+  <a href="#paste">Paste a repo</a>
+  <a href="#how">How it works</a>
+  <a href="#flags">Flags</a>
+  <a href="#why">Why this shape</a>
 </nav>
 
-<!-- ERROR -->
-<h2 id="error"><span class="num">I.</span>The fundamental error in workstation</h2>
+<!-- USE -->
+<h2 id="use"><span class="num">I.</span>Use</h2>
 
-<p>Workstation is a 40 KB shell script, top to bottom. You run <code class="inline">sh startup.sh</code> and it installs 35+ tools in a fixed order. It works. It is also a category of mistake the field has been repeating for fifteen years.</p>
+<h3>Two commands</h3>
 
-<p>Seven concrete failures of the imperative one-shot pattern:</p>
+<pre>fanout claude N "prompt"        # N tmux panes, all running the same prompt
+fanout claude N "p1" "p2" "p3"  # N panes, one prompt each (count must match)
+fanout plan "task description"  # orchestrator-Claude decides N + prompts, then launches</pre>
 
-<ol>
-  <li><b>Not idempotent.</b> Re-running re-installs. <code class="inline">brew install X</code> on an installed formula sometimes upgrades, sometimes no-ops, sometimes errors. Output depends on the tool. The script has no model of this.</li>
-  <li><b>No plan before apply.</b> Want to see what <em>will</em> happen before it does? Read 40 KB of bash. There is no preview. You trust or you don't.</li>
-  <li><b>No rollback.</b> Step 43 fails on a stale cask lock. Steps 1–42 already ran. Step 44–N never will. You have a half-configured machine and no way back.</li>
-  <li><b>No state.</b> Three months later, did workstation install <code class="inline">node</code>, or did you? The script has no record. You cannot diff what's mine vs what came from the tool.</li>
-  <li><b>No selection.</b> Want only AWS + Node? Fork the script and delete lines. No profiles. All-or-nothing.</li>
-  <li><b>No verification.</b> Script exits. Did <code class="inline">docker ps</code> actually work? Did <code class="inline">aws --version</code> succeed? Unknown until you try to use the tool.</li>
-  <li><b>No drift detection.</b> You install something off-script. Workstation has no idea. Re-running can clobber your custom state.</li>
-</ol>
+<h3>Same prompt across N panes</h3>
 
-<p>Each of these is a Terraform/Nix lesson. Mainstream "set up your dev env" scripts ignored them for a decade. fanout adopts them all.</p>
+<pre>fanout claude 2 "build a backend for a typing test app that will take tests and submit them"</pre>
 
-<p class="pull">The point isn't that workstation is bad. The point is that imperative bootstrap scripts <em>as a category</em> were a mistake the field repeated. fanout is the answer.</p>
+<p>Two panes spawn in a detached tmux session. Each runs <code class="inline">claude -p</code> with that prompt. You attach (<code class="inline">tmux attach -t fanout_xxx</code>) to watch live, or wait for the orchestrator to print aggregated output at the end.</p>
 
-<!-- FIX -->
-<h2 id="fix"><span class="num">II.</span>The fix, in five commands</h2>
+<h3>Different prompts per pane</h3>
 
-<pre>fanout init                    # writes ~/.fanout/workstation.yml from a template
-fanout plan                    # shows + (install) / - (remove) / = (keep) per bucket
-fanout apply                   # converges your machine; snapshots before; idempotent
-fanout state diff              # detects drift since last apply
-fanout rollback                # restores the most recent snapshot</pre>
+<pre>fanout claude 3 "design the schema" "write the API" "write the frontend"</pre>
 
-<p>Plus the AI shortcut:</p>
+<h3>Let Claude decide</h3>
 
-<pre>fanout ai "set up a Python ML rig with PyTorch, Jupyter, and Docker"
-# Claude writes the manifest. You see it. [a]ccept / [e]dit / [r]egen / [q]uit. fanout apply.</pre>
+<pre>fanout plan "build a typing-test app with Go backend, Postgres, and a React frontend"</pre>
 
-<!-- ARCHITECTURE -->
-<h2 id="arch"><span class="num">III.</span>Architecture</h2>
+<p>An orchestrator Claude reads your task, decides how many agents make sense, writes one self-contained prompt per agent, and then launches them. Returns JSON <code class="inline">{n, rationale, tasks}</code> internally; you see the rationale + per-agent prompt previews before the panes spawn.</p>
 
-<p>One YAML file is the source of truth. The engine reads it, asks each adapter what's currently installed, computes a diff, applies it. State written to <code class="inline">~/.fanout/state.json</code>. Snapshots written to <code class="inline">~/.fanout/snapshots/&lt;ts&gt;.json</code> before each apply.</p>
+<p>Add <code class="inline">--dry-run</code> to see the plan without launching.</p>
+
+<!-- PASTE -->
+<h2 id="paste"><span class="num">II.</span>Paste a repo, or any context</h2>
+
+<p>Every prompt can be prefixed with file content from a path on disk:</p>
+
+<pre>fanout claude 4 "audit each module for security issues" --repo ~/work/my-api
+fanout plan "refactor this codebase to add caching" --repo .</pre>
+
+<p>The repo packer walks the directory, skips <code class="inline">.git</code> / <code class="inline">node_modules</code> / build dirs / binaries / oversized files, and dumps the contents into a <code class="inline">&lt;repo&gt;...&lt;/repo&gt;</code> XML block at the top of every prompt. Capped at ~400 KB total so it stays in context.</p>
+
+<p>Or pipe arbitrary text via stdin:</p>
+
+<pre>git diff HEAD~5 | fanout plan "review this diff for regressions" --paste
+cat docs/spec.md | fanout claude 2 "implement this two different ways" --paste</pre>
+
+<p>Combine: <code class="inline">--repo</code> and <code class="inline">--paste</code> both wrap the prompt with context the agent reads before doing the task.</p>
+
+<!-- HOW -->
+<h2 id="how"><span class="num">III.</span>How it works</h2>
 
 <figure>
-<svg viewBox="0 0 920 460" preserveAspectRatio="xMidYMid meet" role="img" aria-label="fanout architecture">
+<svg viewBox="0 0 920 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="fanout architecture">
   <defs>
     <marker id="ar" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
     </marker>
-    <marker id="ar2" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7a3b2e"/>
-    </marker>
   </defs>
 
-  <rect x="40" y="40" width="180" height="80" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
-  <text x="130" y="68" text-anchor="middle" font-size="13" fill="#1a1a1a" font-weight="600">workstation.yml</text>
-  <text x="130" y="86" text-anchor="middle" font-size="11" fill="#5a5650">profiles + modules</text>
-  <text x="130" y="102" text-anchor="middle" font-size="11" fill="#5a5650">desired state</text>
+  <rect x="20" y="150" width="160" height="60" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="100" y="180" text-anchor="middle" font-size="13" fill="#1a1a1a" font-weight="600">fanout cmd</text>
+  <text x="100" y="198" text-anchor="middle" font-size="11" fill="#5a5650">+ optional repo/paste</text>
 
-  <rect x="40" y="160" width="180" height="80" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
-  <text x="130" y="188" text-anchor="middle" font-size="13" fill="#1a1a1a" font-weight="600">state.json</text>
-  <text x="130" y="206" text-anchor="middle" font-size="11" fill="#5a5650">what fanout owns</text>
-  <text x="130" y="222" text-anchor="middle" font-size="11" fill="#5a5650">+ snapshot list</text>
+  <rect x="220" y="50" width="170" height="60" rx="3" fill="#faf3e0" stroke="#7a3b2e" stroke-dasharray="3,3"/>
+  <text x="305" y="78" text-anchor="middle" font-size="13" fill="#7a3b2e" font-weight="600">orchestrator</text>
+  <text x="305" y="96" text-anchor="middle" font-size="11" fill="#5a5650">(only for `plan`)</text>
 
-  <rect x="320" y="100" width="200" height="100" rx="3" fill="#faf3e0" stroke="#7a3b2e" stroke-width="1.5"/>
-  <text x="420" y="128" text-anchor="middle" font-size="14" fill="#7a3b2e" font-weight="700">engine</text>
-  <text x="420" y="148" text-anchor="middle" font-size="11" fill="#5a5650">plan / apply / verify</text>
-  <text x="420" y="164" text-anchor="middle" font-size="11" fill="#5a5650">rollback / drift</text>
-  <text x="420" y="184" text-anchor="middle" font-size="11" fill="#5a5650">snapshot before apply</text>
+  <rect x="220" y="245" width="170" height="60" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="305" y="273" text-anchor="middle" font-size="13" fill="#1a1a1a" font-weight="600">N prompts</text>
+  <text x="305" y="291" text-anchor="middle" font-size="11" fill="#5a5650">one per agent</text>
 
-  <rect x="600" y="20"  width="280" height="50" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
-  <text x="740" y="48" text-anchor="middle" font-size="12" fill="#1a1a1a">brew (formula)</text>
-  <rect x="600" y="80"  width="280" height="50" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
-  <text x="740" y="108" text-anchor="middle" font-size="12" fill="#1a1a1a">cask (GUI apps)</text>
-  <rect x="600" y="140" width="280" height="50" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
-  <text x="740" y="168" text-anchor="middle" font-size="12" fill="#1a1a1a">npm_global</text>
-  <rect x="600" y="200" width="280" height="50" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
-  <text x="740" y="228" text-anchor="middle" font-size="12" fill="#1a1a1a">pip --user</text>
-  <rect x="600" y="260" width="280" height="50" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
-  <text x="740" y="288" text-anchor="middle" font-size="12" fill="#1a1a1a">curl (marker-file)</text>
+  <rect x="430" y="150" width="160" height="60" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="510" y="180" text-anchor="middle" font-size="13" fill="#1a1a1a" font-weight="600">tmux new-session</text>
+  <text x="510" y="198" text-anchor="middle" font-size="11" fill="#5a5650">N-1 split-windows</text>
 
-  <line x1="220" y1="80"  x2="320" y2="130" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#ar)"/>
-  <line x1="220" y1="200" x2="320" y2="170" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#ar)"/>
-  <line x1="520" y1="120" x2="600" y2="45"  stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
-  <line x1="520" y1="140" x2="600" y2="105" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
-  <line x1="520" y1="150" x2="600" y2="165" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
-  <line x1="520" y1="170" x2="600" y2="225" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
-  <line x1="520" y1="180" x2="600" y2="285" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <rect x="640" y="40"  width="240" height="48" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="760" y="68" text-anchor="middle" font-size="13" fill="#1a1a1a">pane 1: claude -p "p1"</text>
+  <rect x="640" y="100" width="240" height="48" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="760" y="128" text-anchor="middle" font-size="13" fill="#1a1a1a">pane 2: claude -p "p2"</text>
+  <rect x="640" y="160" width="240" height="48" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="760" y="188" text-anchor="middle" font-size="13" fill="#1a1a1a">pane 3: claude -p "p3"</text>
+  <rect x="640" y="220" width="240" height="48" rx="3" fill="#faf3e0" stroke="#1a1a1a"/>
+  <text x="760" y="248" text-anchor="middle" font-size="13" fill="#1a1a1a">pane N: …</text>
+  <rect x="640" y="280" width="240" height="48" rx="3" fill="#faf3e0" stroke="#3d6b3a"/>
+  <text x="760" y="304" text-anchor="middle" font-size="13" fill="#3d6b3a" font-weight="600">poll W*.done; aggregate</text>
 
-  <rect x="60"  y="340" width="180" height="50" rx="3" fill="#faf3e0" stroke="#3d6b3a"/>
-  <text x="150" y="365" text-anchor="middle" font-size="12" fill="#3d6b3a" font-weight="600">install / remove</text>
-  <text x="150" y="382" text-anchor="middle" font-size="10" fill="#5a5650">tmux pane per adapter</text>
-
-  <rect x="280" y="340" width="180" height="50" rx="3" fill="#faf3e0" stroke="#7a3b2e"/>
-  <text x="370" y="365" text-anchor="middle" font-size="12" fill="#7a3b2e" font-weight="600">state.json updated</text>
-  <text x="370" y="382" text-anchor="middle" font-size="10" fill="#5a5650">ownership recorded</text>
-
-  <rect x="500" y="340" width="180" height="50" rx="3" fill="#faf3e0" stroke="#2c4a6b"/>
-  <text x="590" y="365" text-anchor="middle" font-size="12" fill="#2c4a6b" font-weight="600">verify checks</text>
-  <text x="590" y="382" text-anchor="middle" font-size="10" fill="#5a5650">tool actually works?</text>
-
-  <rect x="720" y="340" width="160" height="50" rx="3" fill="#faf3e0" stroke="#5a5650" stroke-dasharray="3,3"/>
-  <text x="800" y="365" text-anchor="middle" font-size="12" fill="#5a5650" font-weight="600">rollback</text>
-  <text x="800" y="382" text-anchor="middle" font-size="10" fill="#5a5650">snapshot inverse</text>
-
-  <line x1="420" y1="200" x2="150" y2="340" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
-  <line x1="420" y1="200" x2="370" y2="340" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
-  <line x1="420" y1="200" x2="590" y2="340" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
-  <path d="M 800 340 Q 800 250 220 200" fill="none" stroke="#7a3b2e" stroke-width="1.0" stroke-dasharray="4,3" marker-end="url(#ar2)"/>
-  <text x="540" y="270" font-size="10" fill="#7a3b2e" font-style="italic">rollback writes inverse to state</text>
+  <line x1="180" y1="180" x2="220" y2="80"  stroke="#7a3b2e" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#ar)"/>
+  <line x1="180" y1="180" x2="220" y2="275" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="390" y1="80"  x2="220" y2="265" stroke="#7a3b2e" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#ar)"/>
+  <line x1="390" y1="275" x2="430" y2="180" stroke="#1a1a1a" stroke-width="1.2" marker-end="url(#ar)"/>
+  <line x1="590" y1="180" x2="640" y2="64"  stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="590" y1="180" x2="640" y2="124" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="590" y1="180" x2="640" y2="184" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="590" y1="180" x2="640" y2="244" stroke="#1a1a1a" stroke-width="1.0" marker-end="url(#ar)"/>
+  <line x1="640" y1="304" x2="590" y2="210" stroke="#3d6b3a" stroke-width="1.0" marker-end="url(#ar)"/>
 </svg>
-<figcaption>Fig. 1 — Manifest + state feed the engine. Engine drives N adapters. Snapshot taken before each apply enables rollback.</figcaption>
+<figcaption>Fig. 1 — `claude` goes directly to N prompts. `plan` adds one orchestrator call first.</figcaption>
 </figure>
 
-<!-- COMPARE -->
-<h2 id="compare"><span class="num">IV.</span>Workstation vs fanout, feature by feature</h2>
+<p>Each pane runs <code class="inline">claude -p "&lt;prompt&gt;" | tee W{i}.out; touch W{i}.done; sleep 86400</code>. The orchestrator polls the <code class="inline">.done</code> sentinels, collects outputs, prints them aggregated, then kills the session (unless <code class="inline">--keep-tmux</code>).</p>
+
+<p>If tmux isn't on PATH, fanout falls back to <code class="inline">asyncio.gather</code> — same N parallel calls, output prints sequentially in your current terminal.</p>
+
+<!-- FLAGS -->
+<h2 id="flags"><span class="num">IV.</span>Flags</h2>
+
+<p>Both <code class="inline">claude</code> and <code class="inline">plan</code> accept:</p>
 
 <table>
-  <thead>
-    <tr><th></th><th>LeuAlmeida/workstation</th><th>fanout</th></tr>
-  </thead>
+  <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
   <tbody>
-    <tr><td>Source format</td><td class="bad">40 KB bash script</td><td class="good">~70 line YAML manifest</td></tr>
-    <tr><td>Idempotent re-run</td><td class="bad">No — collisions, undefined behaviour</td><td class="good">Yes — diff-based; no-op if installed</td></tr>
-    <tr><td>Plan before apply</td><td class="bad">No</td><td class="good"><code class="inline">fanout plan</code></td></tr>
-    <tr><td>Profiles / subset selection</td><td class="bad">No (fork the script)</td><td class="good"><code class="inline">--profile python-ml</code></td></tr>
-    <tr><td>State tracking</td><td class="bad">None</td><td class="good"><code class="inline">~/.fanout/state.json</code></td></tr>
-    <tr><td>Drift detection</td><td class="bad">None</td><td class="good"><code class="inline">fanout state diff</code> (exit 2 on drift)</td></tr>
-    <tr><td>Rollback</td><td class="bad">None</td><td class="good"><code class="inline">fanout rollback</code> via snapshot</td></tr>
-    <tr><td>Verify install works</td><td class="bad">None</td><td class="good"><code class="inline">fanout verify</code> runs configured smoke commands</td></tr>
-    <tr><td>AI manifest generation</td><td class="bad">N/A</td><td class="good"><code class="inline">fanout ai "describe your rig"</code></td></tr>
-    <tr><td>New package manager cost</td><td class="bad">Edit the shell script</td><td class="good">One ~60 LOC <code class="inline">adapters/X.py</code></td></tr>
-    <tr><td>Test suite</td><td class="bad">None</td><td class="good">42 unit tests, subprocess mocked</td></tr>
-    <tr><td>Tool inventory</td><td>35 macOS tools</td><td>same 35 + new ones (manifest is editable)</td></tr>
+    <tr><td><code class="inline">--repo PATH</code></td><td>Pack repo contents (text files only, prune dirs/binaries) as preamble in every prompt.</td></tr>
+    <tr><td><code class="inline">--paste</code></td><td>Read stdin; prepend to every prompt.</td></tr>
+    <tr><td><code class="inline">--no-tmux</code></td><td>Use <code class="inline">asyncio.gather</code> instead of tmux. Output prints sequentially.</td></tr>
+    <tr><td><code class="inline">--keep-tmux</code></td><td>Don't kill the tmux session after panes finish.</td></tr>
+    <tr><td><code class="inline">--timeout SECONDS</code></td><td>Per-pane timeout. Default 600.</td></tr>
   </tbody>
 </table>
 
-<p>Every row in the right column is the answer to a real failure mode of the left column.</p>
-
-<!-- CLI -->
-<h2 id="cli"><span class="num">V.</span>CLI surface</h2>
-
-<pre>fanout init [--from-workstation] [--force]
-fanout edit
-fanout plan [--profile X] [--manifest PATH]
-fanout apply [--profile X] [--dry-run] [--no-snapshot] [--yes]
-fanout state
-fanout state diff
-fanout verify
-fanout rollback [--dry-run]
-fanout ai "&lt;prose description&gt;"
-fanout claude "task a" "task b" [--no-tmux] [--keep-tmux]</pre>
-
-<p>The <code class="inline">claude</code> subcommand is a bonus: dispatch N user-supplied tasks to N parallel <code class="inline">claude -p</code> sessions in tmux panes. Same dispatch engine fanout uses for parallel installers under <code class="inline">apply</code>.</p>
-
-<!-- MANIFEST -->
-<h2 id="manifest"><span class="num">VI.</span>Manifest format</h2>
-
-<pre>version: 1
-
-profiles:
-  default:   [base, web, cloud]
-  python-ml: [base, python, ml]
-
-modules:
-  base:
-    brew: [git, jq, ripgrep, fzf]
-  web:
-    brew: [node]
-    cask: [visual-studio-code]
-    npm_global: [typescript, yarn]
-  cloud:
-    brew: [awscli, kubectl]
-    cask: [docker]
-  python:
-    brew: [python]
-    pip: [poetry, ruff]
-    curl:
-      - name: nvm
-        marker: "~/.nvm/nvm.sh"
-        install: "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash"
-
-settings:
-  apply:
-    parallelism: 4
-    snapshot_before: true
-  verify:
-    checks:
-      - cmd: "git --version"
-      - cmd: "node --version"</pre>
-
-<p><b>Profiles</b> compose <b>modules</b>. Modules group tools into <b>buckets</b> by adapter (<code class="inline">brew</code>, <code class="inline">cask</code>, <code class="inline">npm_global</code>, <code class="inline">pip</code>, <code class="inline">curl</code>). Curl items declare a <code class="inline">marker</code> path that signals already-installed — that's how third-party shell installers (NVM, Oh-My-Zsh, Docker Compose) get idempotence.</p>
-
-<!-- AI -->
-<h2 id="ai"><span class="num">VII.</span>AI mode</h2>
-
-<p>The <code class="inline">fanout ai</code> subcommand sends the user's prose + the current manifest to Claude with a tight system prompt that says: <em>output ONLY YAML matching this schema</em>. The result is validated against the same schema validator the manifest loader uses (aggregated errors, no silent failures). User sees the generated YAML, picks <code class="inline">[a]ccept</code> / <code class="inline">[e]dit</code> / <code class="inline">[r]egen</code> / <code class="inline">[q]uit</code>. On accept, the manifest is written. Then <code class="inline">fanout apply</code> like usual.</p>
-
-<p>This is not magic. It is one Claude call wrapped in a validator. The validator is load-bearing: Claude can and does emit specifics that don't match valid Homebrew formula names. The schema catches it before you run a brew install on a typo.</p>
-
-<!-- HTML REPORTS -->
-<h2 id="html"><span class="num">VIII.</span>HTML reports for every command</h2>
-
-<p>Inspired by Thariq's <a href="https://thariqs.github.io/html-effectiveness/" style="color: var(--accent); border-bottom: 1px solid var(--accent); text-decoration: none;">Unreasonable Effectiveness of HTML</a>: every subcommand emits a self-contained HTML artifact, written to <code class="inline">~/.fanout/reports/&lt;timestamp&gt;-&lt;cmd&gt;.html</code>, and auto-opens in your browser on macOS. Markdown is for diffs. HTML is for humans.</p>
-
-<table>
-  <thead><tr><th>Command</th><th>HTML output</th></tr></thead>
-  <tbody>
-    <tr><td><code class="inline">fanout plan</code></td><td>Summary cards (+install / −remove / =keep), per-adapter bucket sections, color-coded item lists</td></tr>
-    <tr><td><code class="inline">fanout apply</code></td><td>Snapshot id, installed/removed/failed sections, full install logs per bucket</td></tr>
-    <tr><td><code class="inline">fanout state</code></td><td>Per-bucket ownership counts, owned-item lists, snapshot history table</td></tr>
-    <tr><td><code class="inline">fanout state diff</code></td><td>Drift cards, per-bucket off-manifest installs and missing items, with rationale</td></tr>
-    <tr><td><code class="inline">fanout verify</code></td><td>Passed/failed/total counts, per-check status with stderr capture</td></tr>
-    <tr><td><code class="inline">fanout rollback</code></td><td>Re-installed and removed bucket sections, log capture</td></tr>
-    <tr><td><code class="inline">fanout ai "..."</code></td><td>Generated manifest preview with accept status</td></tr>
-    <tr><td><code class="inline">fanout claude "..." "..."</code></td><td>Aggregated per-worker output in collapsible sections</td></tr>
-  </tbody>
-</table>
-
-<p>Two opt-outs:</p>
+<p><code class="inline">plan</code> also:</p>
 <ul>
-  <li><code class="inline">--no-open</code> — write the HTML, don't open the browser.</li>
-  <li><code class="inline">--no-html</code> — terminal output only.</li>
+  <li><code class="inline">-n N</code> — hint to the orchestrator on N (still its decision).</li>
+  <li><code class="inline">--dry-run</code> — print the orchestrator's plan; don't launch panes.</li>
 </ul>
 
-<p class="pull">Markdown stopped scaling at ~100 lines. HTML scales. The chance you actually read your plan before applying it is much higher when it has color, summary cards, and grouping that text cannot do.</p>
+<!-- WHY -->
+<h2 id="why"><span class="num">V.</span>Why this shape</h2>
 
-<!-- LIMITS -->
-<h2 id="limits"><span class="num">IX.</span>What v3 does not do (yet)</h2>
+<p class="pull">Most multi-agent tooling is a framework. This is a bash command.</p>
 
 <ul>
-  <li><b>Linux apt/dnf adapters.</b> macOS-first; Linux is a v3.5 extension — straightforward, one more adapter file.</li>
-  <li><b>Windows.</b> Indefinitely deferred. Brew is the design center.</li>
-  <li><b>Distributed apply over SSH.</b> Multi-machine convergence (one tmux window per remote box) is v4.</li>
-  <li><b>Drift daemon.</b> Opt-in launchd job that runs <code class="inline">state diff</code> hourly and notifies. v4.</li>
-  <li><b>Encrypted secrets.</b> 1Password CLI integration for tokens at apply time. v5.</li>
-  <li><b>Module marketplace.</b> Shareable <code class="inline">.fanout</code> modules. v5.</li>
-  <li><b>True parallelism in apply.</b> Shipped in v3.1 via <code class="inline">fanout apply --tmux</code> — one pane per adapter batch, live progress side by side.</li>
+  <li><b>No install.</b> Clone, symlink, done. No package manager. No pyyaml. No <code class="inline">~/.fanout</code>. Five source files, all stdlib.</li>
+  <li><b>Two subcommands.</b> <code class="inline">claude</code> is the dispatch primitive. <code class="inline">plan</code> is the orchestrator on top of it. You can read both in fifteen minutes.</li>
+  <li><b>tmux as the UI.</b> Panes are the right abstraction for "N things happening at once that I want to watch". The framework layer is the operating system. We're not reinventing it.</li>
+  <li><b>Prompts are self-contained.</b> No worker reads another's output. No graph. No DAG. No message passing. If your task can't be parallelised, the orchestrator returns N=1 and you get one agent. Simple shape, simple guarantees.</li>
+  <li><b>Repo context built in.</b> <code class="inline">--repo</code> is the killer flag. Audit my whole codebase from N angles, in parallel, with the code already in each agent's context.</li>
 </ul>
+
+<p>What this tool deliberately is not: an agent framework, a workflow engine, a config management system, a build tool. It is one bash command that puts N Claudes side by side and gets out of your way.</p>
 
 <hr>
-<p class="footnote">Forked from <a href="https://github.com/LeuAlmeida/workstation" style="color: var(--accent); border-bottom: 1px solid var(--accent); text-decoration: none;">LeuAlmeida/workstation</a> (MIT). fanout is also MIT. See <code class="inline">NOTICE.md</code> for attribution. Repo: <a href="https://github.com/muhibwqr/fanout" style="color: var(--accent); border-bottom: 1px solid var(--accent); text-decoration: none;">github.com/muhibwqr/fanout</a>. v3 shipped 2026-05-10.</p>
+<p class="footnote">github.com/muhibwqr/fanout · MIT. Inspired by the multi-agent dispatch pattern in <a href="https://github.com/LeuAlmeida/workstation" style="color: var(--accent); border-bottom: 1px solid var(--accent); text-decoration: none;">LeuAlmeida/workstation</a> and the HTML-as-output style in <a href="https://thariqs.github.io/html-effectiveness/" style="color: var(--accent); border-bottom: 1px solid var(--accent); text-decoration: none;">Thariq's html-effectiveness</a>.</p>
 
 </main>
 </body>

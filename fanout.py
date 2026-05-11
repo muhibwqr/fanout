@@ -1,15 +1,17 @@
-"""fanout — workstation bootstrap with declarative manifest, plan/apply/state/verify/rollback.
+"""fanout — launch N parallel claude sessions in tmux panes.
 
-Subcommands:
-  init       create ~/.fanout/workstation.yml from a template
-  edit       open ~/.fanout/workstation.yml in $EDITOR
-  plan       show diff: manifest vs installed
-  apply      converge state to manifest
-  state      show owned items
-  verify     run sanity-check commands
-  rollback   restore most recent snapshot
-  ai         generate a manifest from a prose description via Claude
-  claude     direct dispatch: fanout claude "task a" "task b" -> N panes
+Two commands:
+
+  fanout claude N "prompt"                  N panes, all running the same prompt
+  fanout claude N "p1" "p2" ... "pN"        N panes, one prompt each (count must match N)
+  fanout plan "task description"            orchestrator-Claude decides N + prompts, then launches
+
+Universal flags:
+  --repo PATH         package repo contents as preamble to every prompt
+  --paste             read context from stdin and prepend to every prompt
+  --no-tmux           use asyncio.gather instead of tmux panes (output prints sequentially)
+  --keep-tmux         don't kill the tmux session after panes finish
+  --timeout SECONDS   per-pane timeout (default 600)
 """
 from __future__ import annotations
 
@@ -18,536 +20,393 @@ import asyncio
 import json
 import os
 import pathlib
-import shutil
-import subprocess
+import shlex
 import sys
-import tempfile
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-import engine
-import manifest as mf
-import reports
-import state as state_mod
-
-DEFAULT_DIR = pathlib.Path(os.path.expanduser("~/.fanout"))
-DEFAULT_MANIFEST = DEFAULT_DIR / "workstation.yml"
-REPO_DIR = pathlib.Path(__file__).resolve().parent
-TEMPLATE_DEFAULT = REPO_DIR / "manifests" / "default.yml"
-TEMPLATE_WORKSTATION = REPO_DIR / "manifests" / "workstation-port.yml"
+from prompts import ORCHESTRATOR_SYSTEM
+from workers import (
+    BackendError,
+    BackendTimeout,
+    call_claude,
+    dispatch_tmux,
+    kill_tmux_session,
+    parse_claude_envelope,
+    tmux_available,
+    wait_for_done,
+)
 
 
 # ---------------------------------------------------------------------------
-# arg parsing
+# argparse
 # ---------------------------------------------------------------------------
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         prog="fanout",
-        description="Declarative workstation bootstrap. Manifest in, plan/apply out.",
+        description="Launch N parallel Claude sessions in tmux panes.",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_init = sub.add_parser("init", help="Create ~/.fanout/workstation.yml from template.")
-    p_init.add_argument(
-        "--from-workstation",
-        action="store_true",
-        help="Use the LeuAlmeida/workstation port as the starting template.",
+    p_claude = sub.add_parser(
+        "claude",
+        help='Launch N claude sessions: fanout claude N "prompt" [more prompts...]',
     )
-    p_init.add_argument("--force", action="store_true")
-
-    sub.add_parser("edit", help="Open manifest in $EDITOR.")
+    p_claude.add_argument("n", type=int, help="Number of panes (1-10).")
+    p_claude.add_argument(
+        "prompts",
+        nargs="+",
+        help='1 prompt (replicated N times) OR exactly N prompts (one per pane).',
+    )
+    _add_common(p_claude)
 
     p_plan = sub.add_parser(
         "plan",
-        help='Diff manifest vs installed, OR pass a task ("set up Python ML rig") to ask Claude for a plan.',
+        help='Orchestrator-Claude decides N and the per-pane prompts, then launches them.',
     )
+    p_plan.add_argument("task", help='Task description, in prose.')
     p_plan.add_argument(
-        "task",
-        nargs="?",
+        "-n",
+        dest="n_hint",
+        type=int,
         default=None,
-        help='Optional task description. If given, Claude writes a concise plan; if omitted, runs manifest diff.',
+        help="Hint to orchestrator on desired N (still its decision).",
     )
-    p_plan.add_argument("--profile", default="default")
-    p_plan.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
-    p_plan.add_argument("--timeout", type=float, default=300.0, help="Claude call timeout for task plans.")
-    _add_html_flags(p_plan)
-
-    p_apply = sub.add_parser("apply", help="Converge state to manifest.")
-    p_apply.add_argument("--profile", default="default")
-    p_apply.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
-    p_apply.add_argument("--dry-run", action="store_true")
-    p_apply.add_argument("--no-snapshot", action="store_true")
-    p_apply.add_argument("--yes", action="store_true", help="Skip confirmation prompt.")
-    p_apply.add_argument(
-        "--tmux",
+    _add_common(p_plan)
+    p_plan.add_argument(
+        "--dry-run",
         action="store_true",
-        help="Dispatch each adapter batch to its own tmux pane in parallel (visible install progress).",
+        help="Print the orchestrator's plan; do not launch panes.",
     )
-    p_apply.add_argument(
-        "--keep-tmux",
-        action="store_true",
-        help="Don't kill the tmux session after apply finishes (for inspection).",
-    )
-    _add_html_flags(p_apply)
-
-    p_state = sub.add_parser("state", help="Show owned items.")
-    p_state.add_argument("subcmd", nargs="?", choices=["diff"], help='"diff" shows drift.')
-    _add_html_flags(p_state)
-
-    p_verify = sub.add_parser("verify", help="Run verify-section sanity checks.")
-    p_verify.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
-    _add_html_flags(p_verify)
-
-    p_roll = sub.add_parser("rollback", help="Restore most recent snapshot.")
-    p_roll.add_argument("--dry-run", action="store_true")
-    _add_html_flags(p_roll)
-
-    p_ai = sub.add_parser("ai", help='Generate manifest from prose: fanout ai "set up Python ML rig"')
-    p_ai.add_argument("description", help="Prose description of the desired workstation.")
-    p_ai.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
-    p_ai.add_argument("--auto", action="store_true", help="Skip the approval gate.")
-    _add_html_flags(p_ai)
-
-    p_claude = sub.add_parser(
-        "claude",
-        help='Direct dispatch: fanout claude "task a" "task b" -> N parallel claude -p panes.',
-    )
-    p_claude.add_argument("tasks", nargs="+")
-    p_claude.add_argument("--no-tmux", action="store_true")
-    p_claude.add_argument("--keep-tmux", action="store_true")
-    p_claude.add_argument("--timeout", type=float, default=600.0)
-    _add_html_flags(p_claude)
 
     return ap.parse_args(argv)
 
 
-def _add_html_flags(p) -> None:
-    """Default-on HTML report emission. --no-html to skip; --no-open to write but not open."""
+def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
-        "--no-html",
-        dest="html",
-        action="store_false",
-        help="Skip the HTML report (terminal output only).",
+        "--repo",
+        help='Path to a repo or directory; its contents are packaged as preamble in every prompt.',
     )
     p.add_argument(
-        "--no-open",
-        dest="open_browser",
-        action="store_false",
-        help="Write the HTML report but don't auto-open in the browser.",
+        "--paste",
+        action="store_true",
+        help="Read context from stdin and prepend to every prompt.",
     )
-    p.set_defaults(html=True, open_browser=True)
+    p.add_argument(
+        "--no-tmux",
+        action="store_true",
+        help="Use asyncio.gather instead of tmux panes (single-terminal output).",
+    )
+    p.add_argument(
+        "--keep-tmux",
+        action="store_true",
+        help="Don't kill the tmux session after panes finish.",
+    )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=600.0,
+        help="Per-pane timeout in seconds (default 600).",
+    )
 
 
 # ---------------------------------------------------------------------------
-# helpers
+# Context: repo packaging + stdin paste
 # ---------------------------------------------------------------------------
 
 
-def _ensure_dir() -> None:
-    DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
+# Files and directories we never include in a repo dump.
+_SKIP_DIRS = frozenset(
+    {
+        ".git", "node_modules", "dist", "build", "__pycache__",
+        ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache",
+        ".idea", ".vscode", ".next", ".cache", "target",
+    }
+)
+_SKIP_SUFFIXES = (
+    ".pyc", ".pyo", ".so", ".dylib", ".dll", ".class",
+    ".o", ".a", ".exe", ".bin",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z",
+    ".mp3", ".mp4", ".mov", ".avi", ".wav",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".DS_Store",
+)
+_MAX_FILE_BYTES = 100_000        # skip individual files bigger than this
+_MAX_TOTAL_BYTES = 400_000       # truncate repo dump at this many bytes
 
 
-def _load_manifest(path: str):
+def pack_repo(repo_path: str) -> str:
+    """Walk repo and produce a text dump suitable for pasting into a Claude prompt.
+
+    Output format:
+        ===== file: path/to/file.py =====
+        <content>
+        ===== file: path/to/other.md =====
+        <content>
+
+    Skips binaries, prune dirs, oversized files. Truncates at _MAX_TOTAL_BYTES.
+    """
+    root = pathlib.Path(os.path.expanduser(repo_path)).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"--repo path does not exist: {repo_path}")
+    if root.is_file():
+        return _read_one(root, label=str(root.name))
+
+    chunks: List[str] = []
+    total = 0
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(root):
+        # in-place prune
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS and not d.startswith("."))
+        for fname in sorted(filenames):
+            if fname.startswith("."):
+                continue
+            if any(fname.endswith(s) for s in _SKIP_SUFFIXES):
+                continue
+            fp = pathlib.Path(dirpath) / fname
+            try:
+                size = fp.stat().st_size
+            except OSError:
+                continue
+            if size > _MAX_FILE_BYTES:
+                continue
+            rel = str(fp.relative_to(root))
+            chunk = _read_one(fp, label=rel)
+            if total + len(chunk) > _MAX_TOTAL_BYTES:
+                truncated = True
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if truncated:
+            break
+    if truncated:
+        chunks.append("\n===== [TRUNCATED: repo dump hit byte budget] =====\n")
+    return "".join(chunks)
+
+
+def _read_one(fp: pathlib.Path, label: str) -> str:
     try:
-        return mf.load(path)
-    except FileNotFoundError:
+        text = fp.read_text(errors="ignore")
+    except OSError:
+        return ""
+    return f"\n===== file: {label} =====\n{text}\n"
+
+
+def read_stdin_paste() -> str:
+    """Read all of stdin. Returns empty string if stdin is a tty."""
+    if sys.stdin.isatty():
+        return ""
+    return sys.stdin.read()
+
+
+def build_context_preamble(repo: Optional[str], paste: bool) -> str:
+    parts: List[str] = []
+    if repo:
+        parts.append(f"<repo path=\"{repo}\">\n{pack_repo(repo)}\n</repo>\n")
+    if paste:
+        pasted = read_stdin_paste()
+        if pasted.strip():
+            parts.append(f"<paste>\n{pasted}\n</paste>\n")
+    return "".join(parts)
+
+
+def wrap_with_context(prompt: str, preamble: str) -> str:
+    if not preamble:
+        return prompt
+    return preamble + "\n\n<task>\n" + prompt + "\n</task>\n"
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: claude
+# ---------------------------------------------------------------------------
+
+
+def cmd_claude(args) -> int:
+    n = args.n
+    if n < 1 or n > 10:
+        print(f"[fanout] N must be 1-10 (got {n})", file=sys.stderr)
+        return 1
+    prompts = list(args.prompts)
+    if len(prompts) == 1:
+        prompts = prompts * n
+    elif len(prompts) != n:
         print(
-            f"[fanout] no manifest at {path}\n"
-            f"        run `fanout init` (or `fanout init --from-workstation`).",
+            f"[fanout] got {len(prompts)} prompts but N={n}; "
+            f"either supply 1 prompt (replicated) or exactly N prompts.",
             file=sys.stderr,
         )
-        sys.exit(1)
-    except mf.ManifestError as e:
-        print(f"[fanout] manifest invalid:", file=sys.stderr)
-        for err in e.errors:
-            print(f"  - {err}", file=sys.stderr)
-        sys.exit(2)
-
-
-def _print_logs(logs: List[str]) -> None:
-    for line in logs:
-        print(line, file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
-# subcommand: init
-# ---------------------------------------------------------------------------
-
-
-def cmd_init(args) -> int:
-    _ensure_dir()
-    if DEFAULT_MANIFEST.exists() and not args.force:
-        print(f"[fanout] manifest already exists at {DEFAULT_MANIFEST}", file=sys.stderr)
-        print("        re-run with --force to overwrite.", file=sys.stderr)
         return 1
-    src = TEMPLATE_WORKSTATION if args.from_workstation else TEMPLATE_DEFAULT
-    shutil.copy(src, DEFAULT_MANIFEST)
-    print(f"[fanout] wrote {DEFAULT_MANIFEST}", file=sys.stderr)
-    print(f"        template: {src.name}", file=sys.stderr)
-    print(f"        next: `fanout plan` then `fanout apply`", file=sys.stderr)
-    return 0
 
-
-# ---------------------------------------------------------------------------
-# subcommand: edit
-# ---------------------------------------------------------------------------
-
-
-def cmd_edit(args) -> int:
-    if not DEFAULT_MANIFEST.exists():
-        print(f"[fanout] no manifest at {DEFAULT_MANIFEST}. run `fanout init`.", file=sys.stderr)
+    try:
+        preamble = build_context_preamble(args.repo, args.paste)
+    except FileNotFoundError as e:
+        print(f"[fanout] {e}", file=sys.stderr)
         return 1
-    editor = os.environ.get("EDITOR", "vi")
-    return subprocess.call([editor, str(DEFAULT_MANIFEST)])
+    final_prompts = [wrap_with_context(p, preamble) for p in prompts]
+    return asyncio.run(_dispatch(final_prompts, args))
 
 
 # ---------------------------------------------------------------------------
-# subcommand: plan
+# Subcommand: plan
 # ---------------------------------------------------------------------------
 
 
 def cmd_plan(args) -> int:
-    # Task-plan mode: Claude generates a markdown plan, render to HTML titled
-    # "Project Fanout: Launching your Developer Setup Effectively".
-    if args.task:
-        return _cmd_plan_task(args)
-    # Diff mode: existing manifest-vs-installed.
-    manifest = _load_manifest(args.manifest)
-    p = engine.compute_plan(manifest, args.profile)
-    print(engine.render_plan(p))
-    if getattr(args, "html", True):
-        html_text = reports.render_plan(args.profile, p)
-        path = reports.emit("plan", html_text, open_browser=getattr(args, "open_browser", True))
-        print(f"\n[fanout] report: {path}", file=sys.stderr)
-    return 0
+    try:
+        preamble = build_context_preamble(args.repo, args.paste)
+    except FileNotFoundError as e:
+        print(f"[fanout] {e}", file=sys.stderr)
+        return 1
 
-
-def _cmd_plan_task(args) -> int:
-    """Launch Claude to write a concise plan for the user's task; render HTML."""
-    from prompts import PLAN_TASK_SYSTEM
-    from workers import call_claude, parse_claude_envelope
-
-    current_manifest = None
-    mpath = pathlib.Path(args.manifest)
-    if mpath.exists():
-        current_manifest = mpath.read_text()
-
-    print(f"[fanout plan] asking Claude to plan: {args.task!r}", file=sys.stderr)
-    payload = json.dumps(
+    orchestrator_input = json.dumps(
         {
             "task": args.task,
-            "current_manifest_yaml": current_manifest or "(none — user has not run `fanout init` yet)",
-            "available_adapters": ["brew", "cask", "npm_global", "pip", "curl"],
+            "context": preamble if preamble else None,
+            "n_hint": args.n_hint,
         },
         indent=2,
     )
+    print("[fanout plan] asking orchestrator to decompose...", file=sys.stderr)
     try:
         raw = asyncio.run(
-            call_claude(payload, system=PLAN_TASK_SYSTEM, timeout=args.timeout)
+            call_claude(orchestrator_input, system=ORCHESTRATOR_SYSTEM, timeout=args.timeout)
         )
-    except Exception as e:
-        print(f"[fanout plan] Claude call failed: {e}", file=sys.stderr)
+    except (BackendError, BackendTimeout) as e:
+        print(f"[fanout plan] orchestrator failed: {e}", file=sys.stderr)
         return 3
-    plan_md = parse_claude_envelope(raw).strip()
-
-    # Strip code fences if Claude wrapped despite instruction.
-    if plan_md.startswith("```"):
-        lines = plan_md.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        plan_md = "\n".join(lines)
-
-    print(plan_md)
-    if getattr(args, "html", True):
-        html_text = reports.render_task_plan(args.task, plan_md)
-        path = reports.emit(
-            "task-plan", html_text, open_browser=getattr(args, "open_browser", True)
-        )
-        print(f"\n[fanout] report: {path}", file=sys.stderr)
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# subcommand: apply
-# ---------------------------------------------------------------------------
-
-
-def cmd_apply(args) -> int:
-    manifest = _load_manifest(args.manifest)
-    p = engine.compute_plan(manifest, args.profile)
-    print(engine.render_plan(p))
-    if p.nothing_to_do:
-        return 0
-
-    if not args.yes and not args.dry_run:
-        sys.stdout.write("\napply this plan? [y/N] ")
-        sys.stdout.flush()
-        ans = sys.stdin.readline().strip().lower()
-        if ans not in ("y", "yes"):
-            print("[fanout] aborted", file=sys.stderr)
-            return 0
-
-    s = state_mod.load()
-    if getattr(args, "tmux", False) and not args.dry_run:
-        result = engine.apply_plan_tmux(
-            p,
-            s,
-            state_dir=DEFAULT_DIR,
-            snapshot_before=(not args.no_snapshot),
-            keep_session=getattr(args, "keep_tmux", False),
-        )
-    else:
-        result = engine.apply_plan(
-            p, s, state_dir=DEFAULT_DIR,
-            snapshot_before=(not args.no_snapshot) and (not args.dry_run),
-            dry_run=args.dry_run,
-        )
-    _print_logs(result.logs)
-
-    print("\n[apply summary]", file=sys.stderr)
-    for bucket, items in result.installed.items():
-        if items:
-            print(f"  installed {bucket}: {items}", file=sys.stderr)
-    for bucket, items in result.removed.items():
-        if items:
-            print(f"  removed   {bucket}: {items}", file=sys.stderr)
-    for bucket, items in result.failures.items():
-        if items:
-            print(f"  FAILED    {bucket}: {items}", file=sys.stderr)
-    if getattr(args, "html", True):
-        html_text = reports.render_apply(args.profile, p, result, dry_run=args.dry_run)
-        path = reports.emit("apply", html_text, open_browser=getattr(args, "open_browser", True))
-        print(f"\n[fanout] report: {path}", file=sys.stderr)
-    return 0 if result.ok else 3
-
-
-# ---------------------------------------------------------------------------
-# subcommand: state / state diff
-# ---------------------------------------------------------------------------
-
-
-def cmd_state(args) -> int:
-    s = state_mod.load()
-    if args.subcmd == "diff":
-        drift_reports = engine.drift_check(s)
-        if not drift_reports:
-            print("no drift")
-            if getattr(args, "html", True):
-                html_text = reports.render_state_diff([])
-                path = reports.emit("state-diff", html_text, open_browser=getattr(args, "open_browser", True))
-                print(f"[fanout] report: {path}", file=sys.stderr)
-            return 0
-        for r in drift_reports:
-            print(f"[{r.bucket}]")
-            for a in r.added:
-                print(f"  + {a}  (installed off-manifest)")
-            for rm in r.removed:
-                print(f"  - {rm}  (in state but no longer installed)")
-        if getattr(args, "html", True):
-            html_text = reports.render_state_diff(drift_reports)
-            path = reports.emit("state-diff", html_text, open_browser=getattr(args, "open_browser", True))
-            print(f"\n[fanout] report: {path}", file=sys.stderr)
-        return 2
-    # plain `state`
-    print(json.dumps(s.to_dict(), indent=2))
-    if getattr(args, "html", True):
-        html_text = reports.render_state(s)
-        path = reports.emit("state", html_text, open_browser=getattr(args, "open_browser", True))
-        print(f"\n[fanout] report: {path}", file=sys.stderr)
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# subcommand: verify
-# ---------------------------------------------------------------------------
-
-
-def cmd_verify(args) -> int:
-    manifest = _load_manifest(args.manifest)
-    res = engine.verify(manifest)
-    if not res.checks:
-        print("(no verify checks configured)")
-    else:
-        for c in res.checks:
-            mark = "✓" if c["ok"] else "✗"
-            print(f"  {mark} {c['cmd']}")
-            if not c["ok"] and c.get("stderr"):
-                print(f"      {c['stderr']}")
-    if getattr(args, "html", True):
-        html_text = reports.render_verify(res)
-        path = reports.emit("verify", html_text, open_browser=getattr(args, "open_browser", True))
-        print(f"\n[fanout] report: {path}", file=sys.stderr)
-    return 0 if res.ok else 3
-
-
-# ---------------------------------------------------------------------------
-# subcommand: rollback
-# ---------------------------------------------------------------------------
-
-
-def cmd_rollback(args) -> int:
-    s = state_mod.load()
-    res = engine.rollback(s, state_dir=DEFAULT_DIR, dry_run=args.dry_run)
-    _print_logs(res.logs)
-    if getattr(args, "html", True):
-        html_text = reports.render_rollback(res)
-        path = reports.emit("rollback", html_text, open_browser=getattr(args, "open_browser", True))
-        print(f"\n[fanout] report: {path}", file=sys.stderr)
-    return 0 if res.ok else 3
-
-
-# ---------------------------------------------------------------------------
-# subcommand: ai
-# ---------------------------------------------------------------------------
-
-
-async def _ai_generate(description: str, current_manifest: Optional[str]) -> str:
-    from prompts import WORKSTATION_PLANNER_SYSTEM
-    from workers import call_claude, parse_claude_envelope
-
-    payload = json.dumps(
-        {"description": description, "current_manifest_yaml": current_manifest or ""},
-        indent=2,
-    )
-    raw = await call_claude(payload, system=WORKSTATION_PLANNER_SYSTEM, timeout=300.0)
-    return parse_claude_envelope(raw).strip()
-
-
-def cmd_ai(args) -> int:
-    _ensure_dir()
-    current = None
-    if pathlib.Path(args.manifest).exists():
-        current = pathlib.Path(args.manifest).read_text()
-
-    print(f"[fanout ai] generating manifest for: {args.description}", file=sys.stderr)
+    inner = parse_claude_envelope(raw)
     try:
-        text = asyncio.run(_ai_generate(args.description, current))
-    except Exception as e:
-        print(f"[fanout ai] generation failed: {e}", file=sys.stderr)
+        obj = _extract_json(inner)
+    except ValueError as e:
+        print(f"[fanout plan] orchestrator output unparseable: {e}", file=sys.stderr)
+        print(inner[:800], file=sys.stderr)
         return 3
 
-    # Strip code fences if Claude added them.
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines)
-
-    # Validate.
-    try:
-        m = mf.loads(text)
-    except mf.ManifestError as e:
-        print("[fanout ai] generated manifest failed validation:", file=sys.stderr)
-        for err in e.errors:
-            print(f"  - {err}", file=sys.stderr)
-        # Save it anyway for inspection.
-        debug_path = DEFAULT_DIR / "ai-attempt.yml"
-        debug_path.write_text(text)
-        print(f"        full output saved to {debug_path}", file=sys.stderr)
+    if not isinstance(obj, dict) or "n" not in obj or "tasks" not in obj:
+        print(f"[fanout plan] bad orchestrator shape: {obj!r}", file=sys.stderr)
+        return 3
+    n = int(obj["n"])
+    tasks = list(obj["tasks"])
+    rationale = obj.get("rationale", "(no rationale)")
+    if len(tasks) != n:
+        print(
+            f"[fanout plan] mismatch: orchestrator declared n={n} but produced {len(tasks)} tasks",
+            file=sys.stderr,
+        )
         return 3
 
-    print("\n--- generated manifest ---\n")
-    print(text)
-    print("\n--- end manifest ---\n")
+    print(f"[fanout plan] N={n}  rationale: {rationale}", file=sys.stderr)
+    for i, t in enumerate(tasks, start=1):
+        excerpt = t[:120].replace("\n", " ")
+        print(f"  W{i}: {excerpt}{'...' if len(t) > 120 else ''}", file=sys.stderr)
 
-    if args.auto:
-        choice = "a"
-    else:
-        sys.stdout.write("[a]ccept / [e]dit / [r]egen / [q]uit > ")
-        sys.stdout.flush()
-        choice = sys.stdin.readline().strip().lower()
+    if args.dry_run:
+        print(json.dumps(obj, indent=2))
+        return 0
 
-    if choice in ("a", "accept", ""):
-        pathlib.Path(args.manifest).write_text(text)
-        print(f"[fanout ai] wrote {args.manifest}", file=sys.stderr)
-        if getattr(args, "html", True):
-            html_text = reports.render_ai(args.description, text, accepted=True)
-            path = reports.emit("ai", html_text, open_browser=getattr(args, "open_browser", True))
-            print(f"[fanout] report: {path}", file=sys.stderr)
-        return 0
-    if choice in ("e", "edit"):
-        with tempfile.NamedTemporaryFile("w+", suffix=".yml", delete=False) as tf:
-            tf.write(text)
-            tf_path = tf.name
-        editor = os.environ.get("EDITOR", "vi")
-        subprocess.call([editor, tf_path])
-        edited = pathlib.Path(tf_path).read_text()
-        pathlib.Path(args.manifest).write_text(edited)
-        print(f"[fanout ai] wrote edited manifest to {args.manifest}", file=sys.stderr)
-        return 0
-    if choice in ("r", "regen"):
-        print("[fanout ai] regen: re-run `fanout ai \"...\"` with a tighter description", file=sys.stderr)
-        return 0
-    print("[fanout ai] discarded", file=sys.stderr)
-    return 0
+    final_prompts = [wrap_with_context(t, preamble) for t in tasks]
+    return asyncio.run(_dispatch(final_prompts, args))
 
 
 # ---------------------------------------------------------------------------
-# subcommand: claude (direct dispatch)
+# Dispatch
 # ---------------------------------------------------------------------------
 
 
-async def _run_claude_dispatch(args) -> int:
-    from workers import (
-        call_claude,
-        dispatch_tmux,
-        kill_tmux_session,
-        tmux_available,
-        wait_for_done,
-    )
+async def _dispatch(prompts: List[str], args) -> int:
+    use_tmux = (not getattr(args, "no_tmux", False)) and tmux_available()
+    print(f"[fanout] launching {len(prompts)} panes ({'tmux' if use_tmux else 'headless'})...", file=sys.stderr)
 
-    n = len(args.tasks)
-    print(f"[fanout claude] dispatching {n} tasks", file=sys.stderr)
-    use_tmux = (not args.no_tmux) and tmux_available()
-    results: list = []
     if use_tmux:
-        info = dispatch_tmux(list(args.tasks))
-        print(f"[fanout claude] tmux session: {info['session']}", file=sys.stderr)
-        print(f"  attach: tmux attach -t {info['session']}", file=sys.stderr)
+        info = dispatch_tmux(prompts)
+        session = info["session"]
+        print(f"[fanout] tmux session: {session}", file=sys.stderr)
+        print(f"  attach: tmux attach -t {session}", file=sys.stderr)
         print(f"  logs:   {info['run_dir']}/W*.out", file=sys.stderr)
-        results = await wait_for_done(info["pane_files"], timeout=args.timeout * 2)
+        results = await wait_for_done(info["pane_files"], timeout=getattr(args, "timeout", 600.0) * 2)
         for r in results:
             print(f"\n=== W{r['id']} ===\n{r['output']}")
-        if not args.keep_tmux:
-            kill_tmux_session(info["session"])
-    else:
-        coros = [call_claude(t, timeout=args.timeout) for t in args.tasks]
-        outs = await asyncio.gather(*coros, return_exceptions=True)
-        for i, o in enumerate(outs, start=1):
-            text = o if not isinstance(o, Exception) else f"[ERROR] {o}"
-            print(f"\n=== W{i} ===\n{text}")
-            results.append({"id": i, "output": text})
-    if getattr(args, "html", True):
-        html_text = reports.render_claude(results)
-        path = reports.emit("claude", html_text, open_browser=getattr(args, "open_browser", True))
-        print(f"\n[fanout] report: {path}", file=sys.stderr)
-    return 0
+        if not getattr(args, "keep_tmux", False):
+            kill_tmux_session(session)
+            print(f"[fanout] killed tmux session {session}", file=sys.stderr)
+        else:
+            print(f"[fanout] keeping tmux session {session}", file=sys.stderr)
+        return 0
 
-
-def cmd_claude(args) -> int:
-    return asyncio.run(_run_claude_dispatch(args))
+    # Headless
+    coros = [call_claude(p, timeout=getattr(args, "timeout", 600.0)) for p in prompts]
+    outs = await asyncio.gather(*coros, return_exceptions=True)
+    failed = 0
+    for i, o in enumerate(outs, start=1):
+        if isinstance(o, Exception):
+            failed += 1
+            print(f"\n=== W{i} ===\n[ERROR] {type(o).__name__}: {o}")
+        else:
+            print(f"\n=== W{i} ===\n{o}")
+    return 0 if failed == 0 else 3
 
 
 # ---------------------------------------------------------------------------
-# entry
+# JSON extractor (orchestrator output, tolerant of fences/preamble)
+# ---------------------------------------------------------------------------
+
+
+def _extract_json(raw: str):
+    s = (raw or "").strip()
+    if not s:
+        raise ValueError("empty orchestrator output")
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    for i, c in enumerate(s):
+        if c not in "{[":
+            continue
+        sub = _balanced(s, i)
+        if sub is None:
+            continue
+        try:
+            return json.loads(sub)
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("no parseable JSON")
+
+
+def _balanced(s: str, start: int) -> Optional[str]:
+    o = s[start]
+    c = "}" if o == "{" else "]"
+    depth, in_str, esc = 0, False, False
+    for j in range(start, len(s)):
+        ch = s[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == o:
+                depth += 1
+            elif ch == c:
+                depth -= 1
+                if depth == 0:
+                    return s[start : j + 1]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Entry
 # ---------------------------------------------------------------------------
 
 
 HANDLERS = {
-    "init": cmd_init,
-    "edit": cmd_edit,
-    "plan": cmd_plan,
-    "apply": cmd_apply,
-    "state": cmd_state,
-    "verify": cmd_verify,
-    "rollback": cmd_rollback,
-    "ai": cmd_ai,
     "claude": cmd_claude,
+    "plan": cmd_plan,
 }
 
 

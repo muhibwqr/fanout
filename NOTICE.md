@@ -1,23 +1,9 @@
 # NOTICE
 
-## Attribution
+fanout was inspired by two prior works:
 
-The macOS tool inventory in `manifests/default.yml` is derived from
-[`LeuAlmeida/workstation`](https://github.com/LeuAlmeida/workstation) (MIT license).
-That project's `scripts/apple/macosx.sh` was the source list of brew, cask, and npm
-packages we port into the declarative manifest format.
+- **Multi-agent dispatch pattern** — [LeuAlmeida/workstation](https://github.com/LeuAlmeida/workstation) (MIT). An earlier version of fanout forked workstation's tool inventory and built a Terraform-for-laptop layer on top of it. That version is preserved in git history (commits `550140c` through `1b2ab73`). The current fanout is a separate idea: parallel Claude agents in tmux panes, prompted by you or by an orchestrator-Claude.
 
-## What is original to fanout
+- **HTML-as-output** — [Thariq's html-effectiveness](https://thariqs.github.io/html-effectiveness/). The aesthetic of `multi_agent_fanout.html` and earlier report-rendering experiments owe to that essay.
 
-- The declarative manifest format (`workstation.yml`).
-- The `plan` / `apply` / `state` / `verify` / `rollback` engine.
-- Per-package-manager adapter architecture (`adapters/brew.py`, `adapters/npm.py`, etc).
-- Idempotence + drift detection via the state file.
-- tmux pane dispatch of installer tasks (reused from fanout's earlier multi-agent
-  pipeline; see `workers.py`).
-- AI manifest generation via Claude (`fanout ai "describe your workstation"`).
-
-## License
-
-The portions derived from `LeuAlmeida/workstation` carry the MIT license terms of
-that project. fanout itself is also released under MIT. See `LICENSE`.
+The current code (fanout.py, workers.py, prompts.py) is original to this repo, MIT-licensed.
