@@ -26,6 +26,7 @@ from typing import List, Optional
 
 import engine
 import manifest as mf
+import reports
 import state as state_mod
 
 DEFAULT_DIR = pathlib.Path(os.path.expanduser("~/.fanout"))
@@ -60,6 +61,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_plan = sub.add_parser("plan", help="Show diff: manifest vs installed.")
     p_plan.add_argument("--profile", default="default")
     p_plan.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
+    _add_html_flags(p_plan)
 
     p_apply = sub.add_parser("apply", help="Converge state to manifest.")
     p_apply.add_argument("--profile", default="default")
@@ -67,20 +69,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_apply.add_argument("--dry-run", action="store_true")
     p_apply.add_argument("--no-snapshot", action="store_true")
     p_apply.add_argument("--yes", action="store_true", help="Skip confirmation prompt.")
+    _add_html_flags(p_apply)
 
     p_state = sub.add_parser("state", help="Show owned items.")
     p_state.add_argument("subcmd", nargs="?", choices=["diff"], help='"diff" shows drift.')
+    _add_html_flags(p_state)
 
     p_verify = sub.add_parser("verify", help="Run verify-section sanity checks.")
     p_verify.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
+    _add_html_flags(p_verify)
 
     p_roll = sub.add_parser("rollback", help="Restore most recent snapshot.")
     p_roll.add_argument("--dry-run", action="store_true")
+    _add_html_flags(p_roll)
 
     p_ai = sub.add_parser("ai", help='Generate manifest from prose: fanout ai "set up Python ML rig"')
     p_ai.add_argument("description", help="Prose description of the desired workstation.")
     p_ai.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
     p_ai.add_argument("--auto", action="store_true", help="Skip the approval gate.")
+    _add_html_flags(p_ai)
 
     p_claude = sub.add_parser(
         "claude",
@@ -90,8 +97,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_claude.add_argument("--no-tmux", action="store_true")
     p_claude.add_argument("--keep-tmux", action="store_true")
     p_claude.add_argument("--timeout", type=float, default=600.0)
+    _add_html_flags(p_claude)
 
     return ap.parse_args(argv)
+
+
+def _add_html_flags(p) -> None:
+    """Default-on HTML report emission. --no-html to skip; --no-open to write but not open."""
+    p.add_argument(
+        "--no-html",
+        dest="html",
+        action="store_false",
+        help="Skip the HTML report (terminal output only).",
+    )
+    p.add_argument(
+        "--no-open",
+        dest="open_browser",
+        action="store_false",
+        help="Write the HTML report but don't auto-open in the browser.",
+    )
+    p.set_defaults(html=True, open_browser=True)
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +191,10 @@ def cmd_plan(args) -> int:
     manifest = _load_manifest(args.manifest)
     p = engine.compute_plan(manifest, args.profile)
     print(engine.render_plan(p))
+    if getattr(args, "html", True):
+        html_text = reports.render_plan(args.profile, p)
+        path = reports.emit("plan", html_text, open_browser=getattr(args, "open_browser", True))
+        print(f"\n[fanout] report: {path}", file=sys.stderr)
     return 0
 
 
@@ -207,6 +236,10 @@ def cmd_apply(args) -> int:
     for bucket, items in result.failures.items():
         if items:
             print(f"  FAILED    {bucket}: {items}", file=sys.stderr)
+    if getattr(args, "html", True):
+        html_text = reports.render_apply(args.profile, p, result, dry_run=args.dry_run)
+        path = reports.emit("apply", html_text, open_browser=getattr(args, "open_browser", True))
+        print(f"\n[fanout] report: {path}", file=sys.stderr)
     return 0 if result.ok else 3
 
 
@@ -218,19 +251,31 @@ def cmd_apply(args) -> int:
 def cmd_state(args) -> int:
     s = state_mod.load()
     if args.subcmd == "diff":
-        reports = engine.drift_check(s)
-        if not reports:
+        drift_reports = engine.drift_check(s)
+        if not drift_reports:
             print("no drift")
+            if getattr(args, "html", True):
+                html_text = reports.render_state_diff([])
+                path = reports.emit("state-diff", html_text, open_browser=getattr(args, "open_browser", True))
+                print(f"[fanout] report: {path}", file=sys.stderr)
             return 0
-        for r in reports:
+        for r in drift_reports:
             print(f"[{r.bucket}]")
             for a in r.added:
                 print(f"  + {a}  (installed off-manifest)")
             for rm in r.removed:
                 print(f"  - {rm}  (in state but no longer installed)")
+        if getattr(args, "html", True):
+            html_text = reports.render_state_diff(drift_reports)
+            path = reports.emit("state-diff", html_text, open_browser=getattr(args, "open_browser", True))
+            print(f"\n[fanout] report: {path}", file=sys.stderr)
         return 2
     # plain `state`
     print(json.dumps(s.to_dict(), indent=2))
+    if getattr(args, "html", True):
+        html_text = reports.render_state(s)
+        path = reports.emit("state", html_text, open_browser=getattr(args, "open_browser", True))
+        print(f"\n[fanout] report: {path}", file=sys.stderr)
     return 0
 
 
@@ -244,12 +289,16 @@ def cmd_verify(args) -> int:
     res = engine.verify(manifest)
     if not res.checks:
         print("(no verify checks configured)")
-        return 0
-    for c in res.checks:
-        mark = "✓" if c["ok"] else "✗"
-        print(f"  {mark} {c['cmd']}")
-        if not c["ok"] and c.get("stderr"):
-            print(f"      {c['stderr']}")
+    else:
+        for c in res.checks:
+            mark = "✓" if c["ok"] else "✗"
+            print(f"  {mark} {c['cmd']}")
+            if not c["ok"] and c.get("stderr"):
+                print(f"      {c['stderr']}")
+    if getattr(args, "html", True):
+        html_text = reports.render_verify(res)
+        path = reports.emit("verify", html_text, open_browser=getattr(args, "open_browser", True))
+        print(f"\n[fanout] report: {path}", file=sys.stderr)
     return 0 if res.ok else 3
 
 
@@ -262,6 +311,10 @@ def cmd_rollback(args) -> int:
     s = state_mod.load()
     res = engine.rollback(s, state_dir=DEFAULT_DIR, dry_run=args.dry_run)
     _print_logs(res.logs)
+    if getattr(args, "html", True):
+        html_text = reports.render_rollback(res)
+        path = reports.emit("rollback", html_text, open_browser=getattr(args, "open_browser", True))
+        print(f"\n[fanout] report: {path}", file=sys.stderr)
     return 0 if res.ok else 3
 
 
@@ -331,6 +384,10 @@ def cmd_ai(args) -> int:
     if choice in ("a", "accept", ""):
         pathlib.Path(args.manifest).write_text(text)
         print(f"[fanout ai] wrote {args.manifest}", file=sys.stderr)
+        if getattr(args, "html", True):
+            html_text = reports.render_ai(args.description, text, accepted=True)
+            path = reports.emit("ai", html_text, open_browser=getattr(args, "open_browser", True))
+            print(f"[fanout] report: {path}", file=sys.stderr)
         return 0
     if choice in ("e", "edit"):
         with tempfile.NamedTemporaryFile("w+", suffix=".yml", delete=False) as tf:
@@ -366,6 +423,7 @@ async def _run_claude_dispatch(args) -> int:
     n = len(args.tasks)
     print(f"[fanout claude] dispatching {n} tasks", file=sys.stderr)
     use_tmux = (not args.no_tmux) and tmux_available()
+    results: list = []
     if use_tmux:
         info = dispatch_tmux(list(args.tasks))
         print(f"[fanout claude] tmux session: {info['session']}", file=sys.stderr)
@@ -382,6 +440,11 @@ async def _run_claude_dispatch(args) -> int:
         for i, o in enumerate(outs, start=1):
             text = o if not isinstance(o, Exception) else f"[ERROR] {o}"
             print(f"\n=== W{i} ===\n{text}")
+            results.append({"id": i, "output": text})
+    if getattr(args, "html", True):
+        html_text = reports.render_claude(results)
+        path = reports.emit("claude", html_text, open_browser=getattr(args, "open_browser", True))
+        print(f"\n[fanout] report: {path}", file=sys.stderr)
     return 0
 
 

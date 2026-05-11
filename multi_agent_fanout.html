@@ -114,6 +114,7 @@
   <a href="#cli">CLI</a>
   <a href="#manifest">Manifest</a>
   <a href="#ai">AI mode</a>
+  <a href="#html">HTML reports</a>
   <a href="#limits">Limits</a>
 </nav>
 
@@ -314,8 +315,35 @@ settings:
 
 <p>This is not magic. It is one Claude call wrapped in a validator. The validator is load-bearing: Claude can and does emit specifics that don't match valid Homebrew formula names. The schema catches it before you run a brew install on a typo.</p>
 
+<!-- HTML REPORTS -->
+<h2 id="html"><span class="num">VIII.</span>HTML reports for every command</h2>
+
+<p>Inspired by Thariq's <a href="https://thariqs.github.io/html-effectiveness/" style="color: var(--accent); border-bottom: 1px solid var(--accent); text-decoration: none;">Unreasonable Effectiveness of HTML</a>: every subcommand emits a self-contained HTML artifact, written to <code class="inline">~/.fanout/reports/&lt;timestamp&gt;-&lt;cmd&gt;.html</code>, and auto-opens in your browser on macOS. Markdown is for diffs. HTML is for humans.</p>
+
+<table>
+  <thead><tr><th>Command</th><th>HTML output</th></tr></thead>
+  <tbody>
+    <tr><td><code class="inline">fanout plan</code></td><td>Summary cards (+install / −remove / =keep), per-adapter bucket sections, color-coded item lists</td></tr>
+    <tr><td><code class="inline">fanout apply</code></td><td>Snapshot id, installed/removed/failed sections, full install logs per bucket</td></tr>
+    <tr><td><code class="inline">fanout state</code></td><td>Per-bucket ownership counts, owned-item lists, snapshot history table</td></tr>
+    <tr><td><code class="inline">fanout state diff</code></td><td>Drift cards, per-bucket off-manifest installs and missing items, with rationale</td></tr>
+    <tr><td><code class="inline">fanout verify</code></td><td>Passed/failed/total counts, per-check status with stderr capture</td></tr>
+    <tr><td><code class="inline">fanout rollback</code></td><td>Re-installed and removed bucket sections, log capture</td></tr>
+    <tr><td><code class="inline">fanout ai "..."</code></td><td>Generated manifest preview with accept status</td></tr>
+    <tr><td><code class="inline">fanout claude "..." "..."</code></td><td>Aggregated per-worker output in collapsible sections</td></tr>
+  </tbody>
+</table>
+
+<p>Two opt-outs:</p>
+<ul>
+  <li><code class="inline">--no-open</code> — write the HTML, don't open the browser.</li>
+  <li><code class="inline">--no-html</code> — terminal output only.</li>
+</ul>
+
+<p class="pull">Markdown stopped scaling at ~100 lines. HTML scales. The chance you actually read your plan before applying it is much higher when it has color, summary cards, and grouping that text cannot do.</p>
+
 <!-- LIMITS -->
-<h2 id="limits"><span class="num">VIII.</span>What v3 does not do (yet)</h2>
+<h2 id="limits"><span class="num">IX.</span>What v3 does not do (yet)</h2>
 
 <ul>
   <li><b>Linux apt/dnf adapters.</b> macOS-first; Linux is a v3.5 extension — straightforward, one more adapter file.</li>

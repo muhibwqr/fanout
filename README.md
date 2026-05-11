@@ -1,6 +1,6 @@
 # fanout
 
-> Declarative workstation bootstrap. Manifest in. Plan/apply/state/verify/rollback out.
+> Declarative workstation bootstrap. Manifest in. Plan/apply/state/verify/rollback out — every command emits an HTML report and opens it in your browser.
 
 Forked the tool inventory from [LeuAlmeida/workstation](https://github.com/LeuAlmeida/workstation) (MIT). Replaced the architecture.
 
@@ -19,6 +19,18 @@ python3 -m pip install --user pyyaml
 ```
 
 Tests: `python3 -m pytest -v`.
+
+## HTML-first communication
+
+Inspired by Thariq's [Unreasonable Effectiveness of HTML](https://thariqs.github.io/html-effectiveness/). Every fanout command writes a self-contained HTML artifact to `~/.fanout/reports/<timestamp>-<cmd>.html` and (on macOS) auto-opens it in the default browser.
+
+- **Information density**: tables, color, summary cards, per-bucket grouping that text cannot do legibly.
+- **Easy to share**: upload to S3 or pass the file directly. No "read this 400-line bash log".
+- **Stay in the loop**: you actually read the plan before applying. Drift is visible at a glance.
+
+Default: HTML on, browser auto-opens. Opt out per-command:
+- `--no-open` — write the report, don't open.
+- `--no-html` — terminal output only, no report.
 
 ## First run
 
