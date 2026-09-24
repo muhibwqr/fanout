@@ -1,163 +1,120 @@
-# fanout
+# fanout v5
 
-> Launch N parallel Claude agents in tmux panes. One bash command. No install.
+Split a coding task, let [Jev](https://openrouter.ai/typesafe/jev-1.13) pick the best **installed** coding agent for each piece, and run them in parallel, with [caveman](https://github.com/JuliusBrussee/caveman), [rtk](https://github.com/rtk-ai/rtk) and [headroom](https://github.com/headroomlabs-ai/headroom) cutting tokens on every worker.
 
-```sh
-git clone https://github.com/muhibwqr/fanout
-cd fanout
-chmod +x run.sh
-ln -sf "$(pwd)/run.sh" ~/.local/bin/fanout
+You can call it from Claude Code, Codex, Cursor, Gemini CLI, Windsurf, Zed, a plain terminal, or any tool that speaks MCP or can run a shell command.
+
 ```
+fanout plan "add OAuth login, tests for it, and update the docs"
 
-That's it. `~/.local/bin` is on most PATHs. If not, run `./run.sh` directly.
-
-Requires: `python3`, `claude` CLI on PATH, `tmux` (recommended; falls back to single-terminal headless if missing). No pip installs. No system packages. No `~/.fanout/` directory. Nothing to clean up.
-
----
-
-## Two commands
-
-### `fanout claude N "prompt"`
-
-Launch N Claude sessions in N tmux panes side by side. Each one runs the same prompt:
-
-```sh
-fanout claude 2 "build a backend for a typing test app that will take tests and submit them"
+[fanout] host=cursor  agents=claude,codex,gemini  jev=on
+[fanout] width=3 (jev)  planner=openrouter  auth, tests, and docs split cleanly
+  W1 wave1 claude  conf=0.81 size=medium  boost=caveman:full,headroom  [jev]  OAuth login flow
+  W2 wave2 codex   conf=0.74 size=small   boost=caveman:ultra,rtk      [jev] after 1  tests for OAuth
+  W3 wave1 gemini  conf=0.69 size=small   boost=caveman:lite           [jev]  update docs
 ```
-
-Two panes spawn. Each runs `claude -p` with that exact prompt. You watch them work in parallel.
-
-**Different prompts per pane** — pass exactly N prompts:
-
-```sh
-fanout claude 3 "design the schema" "write the API" "write the frontend"
-```
-
-### `fanout plan "task description"`
-
-Don't know how to split the work? Let Claude decide. The orchestrator reads your task, decides how many agents, writes one prompt per agent, then launches them:
-
-```sh
-fanout plan "build a typing-test app with a Go backend, Postgres, and a React frontend"
-```
-
-Output:
-```
-[fanout plan] asking orchestrator to decompose...
-[fanout plan] N=4  rationale: split by stack layer for clean parallelism
-  W1: Design the Postgres schema for users, tests, submissions...
-  W2: Write a Go backend that serves the schema from W1...
-  W3: Write a React frontend that talks to the W2 API...
-  W4: Write deployment + docker-compose tying it together...
-[fanout] launching 4 panes (tmux)...
-[fanout] tmux session: fanout_a3b8c1
-  attach: tmux attach -t fanout_a3b8c1
-```
-
-Add `--dry-run` to see the orchestrator's plan without launching.
-
----
-
-## Paste a repo or context
-
-Include repo contents as preamble in every prompt:
-
-```sh
-fanout claude 4 "audit each module for security issues" --repo ~/work/my-api
-fanout plan "refactor this codebase to add caching" --repo .
-```
-
-Or pipe arbitrary context via stdin:
-
-```sh
-git diff HEAD~5 | fanout plan "review this diff for regressions" --paste
-cat README.md | fanout claude 2 "rewrite this in two different voices" --paste
-```
-
-Repo packing skips `.git`, `node_modules`, binaries, oversized files. Caps the dump at ~400KB so it fits in the model's context cleanly.
-
----
-
-## Flags
-
-Both `claude` and `plan` accept:
-
-| Flag | Effect |
-|------|--------|
-| `--repo PATH` | Pack repo contents as preamble in every prompt. |
-| `--paste` | Read stdin and prepend to every prompt. |
-| `--no-tmux` | Run sequentially in this terminal (asyncio.gather). |
-| `--keep-tmux` | Don't kill the tmux session after panes finish. |
-| `--timeout SECONDS` | Per-pane wall-clock timeout. Default 600. |
-
-`plan` also has:
-- `-n N` — hint the orchestrator about desired count (still its decision).
-- `--dry-run` — print the plan; don't launch.
-
----
 
 ## How it works
 
-```
-              ┌────────────────────────────┐
-              │ fanout claude N "prompt"   │
-              └─────────────┬──────────────┘
-                            │
-              ┌─────────────▼──────────────┐
-              │ build N prompts            │
-              │ (optionally wrap in repo/  │
-              │  paste preamble)           │
-              └─────────────┬──────────────┘
-                            │
-              ┌─────────────▼──────────────┐
-              │ tmux new-session + N-1     │
-              │ split-windows; one pane    │
-              │ per claude -p invocation   │
-              └─────────────┬──────────────┘
-                            │
-              ┌─────────────▼──────────────┐
-              │ poll W*.done sentinels;    │
-              │ collect W*.out; print      │
-              │ aggregated output;         │
-              │ kill session (or keep).    │
-              └────────────────────────────┘
-```
+1. **Discover.** `agents.py` checks PATH for 12 agent CLIs (claude, codex, gemini, cursor-agent, opencode, aider, goose, qwen, amp, copilot, droid, crush), plus anything you add in `~/.config/fanout/agents.json`. It also detects which tool is calling fanout, from the MCP `clientInfo` or from env markers.
+2. **Width.** Jev scores how many parallel agents the task deserves (`score` question).
+3. **Plan.** A planner writes self-contained subtask prompts. It tries, in order: the calling host (when it passes `subtasks` over MCP), an OpenRouter chat model, a local agent CLI in read-only mode, and finally a naive split.
+4. **Route.** For each subtask, Jev answers typed questions:
+   - `agent` (`choice` over the installed agents, described by their strengths)
+   - `independent` (`noul`)
+   - `size` (`score`, which sets the timeout)
+   - `caveman` level (`score`: lite, full, or ultra)
+   - `shell_heavy` (`noul`, turns on rtk)
+   - `context_heavy` (`noul`, turns on headroom)
 
-`fanout plan` adds one extra step at the front: a single `claude -p` call with an orchestrator system prompt that returns JSON `{n, rationale, tasks: [N prompts]}`. Then the dispatch is identical.
+   Close calls get balanced across agents. Dependent subtasks run in later waves and receive their upstream output.
+5. **Run.** Each worker runs its agent headlessly (`claude -p`, `codex exec`, `gemini -p`, `cursor-agent -p`, ...), either in tmux panes (one window per wave) or detached/headless. State is kept in `~/.cache/fanout/runs/<id>/`.
 
----
+Without an OpenRouter key, every Jev step falls back to deterministic heuristics, and the plan shows `[heuristic]` instead of `[jev]`.
 
-## Tests
+## Install
 
-```sh
-python3 -m pytest -v
+```bash
+git clone https://github.com/muhibwqr/fanout && cd fanout
+./run.sh install          # link ~/.local/bin/fanout, register MCP in every detected client, run `fanout boost`
+export OPENROUTER_API_KEY=sk-or-...   # or: echo sk-or-... > ~/.config/fanout/openrouter_key
+fanout doctor
 ```
 
-25 tests across argparse, repo packing, JSON extraction. Subprocess-free; <0.2s.
+`fanout install` registers the stdio MCP server `fanout mcp` like this:
 
----
+| client | how |
+|---|---|
+| Claude Code | `claude mcp add --scope user fanout -- run.sh mcp` |
+| Codex | `codex mcp add fanout -- run.sh mcp` |
+| Gemini CLI | `gemini mcp add --scope user fanout run.sh mcp` |
+| Cursor | `~/.cursor/mcp.json` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| anything else | point its MCP config at `run.sh mcp`, or shell out to `fanout exec` / `fanout ... --json` |
 
-## Files
+It also copies `skills/fanout/SKILL.md` into `~/.claude/skills` and `~/.agents/skills`.
+
+## Boosts
+
+`fanout boost` installs and wires all three tools. It is idempotent, and `--dry-run` shows what it would do.
+
+- **caveman**: installed for every detected agent via `npx github:JuliusBrussee/caveman`. fanout also appends a caveman directive to each worker prompt at the level Jev picked, so it works even without the skill installed.
+- **rtk**: `brew install rtk` (or cargo/curl), then `rtk init -g [--codex|--gemini|--agent cursor|...]` for each agent. Shell-heavy workers are told to prefix commands with `rtk`.
+- **headroom**: `uv tool install "headroom-ai[all]"` (or pipx/pip). For context-heavy workers, fanout starts one shared `headroom proxy` on port 8787 and points `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` at it.
+
+You can turn any of them off per run with `--no-caveman`, `--no-rtk`, or `--no-headroom`.
+
+## Commands
 
 ```
-fanout/
-  fanout.py          CLI: claude + plan subcommands, repo packing, dispatch
-  workers.py         tmux session/pane spawning, async claude wrapper
-  prompts.py         ORCHESTRATOR_SYSTEM (for `fanout plan`)
-  run.sh             entrypoint (resolves symlink, exec python)
-  tests/
-    test_fanout.py
+fanout plan "task" [-n N] [--max 6] [--planner auto|openrouter|naive|<agent>]
+fanout run "p1" "p2" ...          # you split the task; Jev routes each piece
+fanout <agent> N "prompt" ...     # N copies of one agent: claude, codex, gemini, cursor, ...
+fanout agents | doctor | boost [--dry-run] [--status]
+fanout status [RUN] | logs [RUN] [--tail N]
+fanout exec < request.json        # {"task" | "prompts" | "subtasks", "n", "agents", "pin", "dry_run", "wait", ...}
+fanout mcp                        # tools: fanout_agents, fanout_plan, fanout_run, fanout_status, fanout_results, fanout_doctor, fanout_boost
+fanout install [--clients claude,cursor] [--dry-run]
 ```
 
-Five source files. No config. No state. No reports directory.
+Flags that work on every run command:
 
----
+- `--repo PATH`, `--paste`: add shared context to every prompt
+- `--agents a,b`, `--pin agent`: restrict agents or force one
+- `--no-tmux`, `--keep-tmux`, `--detach`, `--json`
+- `--timeout S`, `--cwd DIR`, `--yolo`, `--no-jev`
 
-## License
+`--yolo` passes each agent's own skip-permissions flag. Without it, fanout uses the agent's safe edit mode, such as Claude's `acceptEdits` or Gemini's `auto_edit`.
 
-MIT.
+## Custom agents
 
-Inspired by the multi-agent dispatch pattern in
-[LeuAlmeida/workstation](https://github.com/LeuAlmeida/workstation) and
-the HTML communication style in
-[Thariq's html-effectiveness](https://thariqs.github.io/html-effectiveness/).
+```json
+// ~/.config/fanout/agents.json
+{
+  "myagent": {"bins": ["myagent"], "cmd": ["{bin}", "--print", "{prompt}"], "strengths": "what it's good at", "api": "openai"},
+  "aider": null
+}
+```
+
+Setting an agent to `null` removes it. Any field of a built-in agent can be overridden.
+
+## Env
+
+| var | default |
+|---|---|
+| `OPENROUTER_API_KEY` / `FANOUT_OPENROUTER_API_KEY` | none (heuristic routing) |
+| `FANOUT_JEV_MODEL` | `typesafe/jev-1.13` |
+| `FANOUT_PLANNER_MODEL` | `openai/gpt-4o-mini` |
+| `FANOUT_HOST` | auto-detected |
+| `FANOUT_CONFIG_DIR` | `~/.config/fanout` |
+| `FANOUT_RUNS_DIR` | `~/.cache/fanout/runs` |
+| `FANOUT_HEADROOM_PORT` | `8787` |
+
+## Dev
+
+Requires Python 3.9+ and uses only the stdlib. The tests need pytest.
+
+```bash
+python3 -m pytest -q   # no network, uses fake agents
+./smoke.sh             # tests, every --help, plus an end-to-end run and an MCP handshake with fake agents
+```

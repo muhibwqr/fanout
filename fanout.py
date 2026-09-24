@@ -1,17 +1,16 @@
-"""fanout — launch N parallel claude sessions in tmux panes.
+"""fanout: split a task, let Jev route each piece to the best installed coding agent,
+run them in parallel (tmux panes or headless), with caveman + rtk + headroom on.
 
-Two commands:
-
-  fanout claude N "prompt"                  N panes, all running the same prompt
-  fanout claude N "p1" "p2" ... "pN"        N panes, one prompt each (count must match N)
-  fanout plan "task description"            orchestrator-Claude decides N + prompts, then launches
-
-Universal flags:
-  --repo PATH         package repo contents as preamble to every prompt
-  --paste             read context from stdin and prepend to every prompt
-  --no-tmux           use asyncio.gather instead of tmux panes (output prints sequentially)
-  --keep-tmux         don't kill the tmux session after panes finish
-  --timeout SECONDS   per-pane timeout (default 600)
+  fanout plan "task"                 plan -> Jev routes -> run   (the main command)
+  fanout run "p1" "p2" ...           Jev routes each prompt you give it -> run
+  fanout <agent> N "prompt" ...      N copies of one agent (claude, codex, gemini, cursor, ...)
+  fanout agents                      what's installed + who's calling
+  fanout doctor                      agents, Jev, planner, boosts, tmux
+  fanout boost                       install/wire caveman, rtk, headroom into every agent
+  fanout status|logs [RUN]           inspect a run
+  fanout exec  < request.json        JSON in / JSON out, for any tool that can shell out
+  fanout mcp                         stdio MCP server (Claude, Codex, Cursor, Gemini, ...)
+  fanout install                     register the MCP server + skill in every detected client
 """
 from __future__ import annotations
 
@@ -20,21 +19,175 @@ import asyncio
 import json
 import os
 import pathlib
-import shlex
+import subprocess
 import sys
-from typing import List, Optional, Tuple
+import time
+from typing import Dict, List, Optional
 
-from prompts import ORCHESTRATOR_SYSTEM
-from workers import (
-    BackendError,
-    BackendTimeout,
-    call_claude,
-    dispatch_tmux,
-    kill_tmux_session,
-    parse_claude_envelope,
-    tmux_available,
-    wait_for_done,
-)
+import boost as boostmod
+import dispatch
+import install
+import jev
+import mcp_server
+import planner as plannermod
+import router
+from agents import BUILTIN, detect, detect_host
+from context import build_context_preamble, pack_repo, wrap_with_context  # noqa: F401  (public API)
+from planner import extract_json as _extract_json  # noqa: F401  (public API)
+
+HERE = pathlib.Path(__file__).resolve().parent
+
+
+def eprint(*a) -> None:
+    print(*a, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# core API (shared by CLI, `exec`, and the MCP server)
+# ---------------------------------------------------------------------------
+
+
+def make_plan(
+    task: str,
+    *,
+    subtasks: Optional[List[dict]] = None,
+    n_hint: Optional[int] = None,
+    max_n: int = 6,
+    only: Optional[List[str]] = None,
+    pin: Optional[str] = None,
+    planner: str = "auto",
+    use_jev: bool = True,
+    boosts: Optional[Dict[str, bool]] = None,
+    preamble: str = "",
+    host: Optional[str] = None,
+    cwd: Optional[str] = None,
+    yolo: bool = False,
+    timeout: Optional[int] = None,
+    balance: bool = True,
+) -> dict:
+    agents = detect(only)
+    if pin:
+        if pin not in agents:
+            raise SystemExit(f"fanout: agent {pin!r} is not installed (found: {', '.join(agents) or 'none'})")
+    if not agents:
+        raise SystemExit("fanout: no coding agents found on PATH. Run `fanout agents` to see what's supported.")
+    host = host or detect_host()
+
+    if subtasks:
+        width = {"n": len(subtasks), "source": "caller"}
+        rationale, psrc = "subtasks supplied by caller", "caller"
+    else:
+        n, wsrc = router.route_width(task, context=preamble, max_n=max_n, hint=n_hint, use_jev=use_jev)
+        width = {"n": n, "source": wsrc}
+        subtasks, rationale, psrc = plannermod.plan(task, n, context=preamble, agents=agents,
+                                                    planner=planner, host=host)
+    assignments = router.assign(task, subtasks, agents, boosts=boosts, use_jev=use_jev,
+                                balance=balance, pin=pin)
+    return {
+        "task": task,
+        "created": time.time(),
+        "host": host,
+        "cwd": os.path.abspath(cwd or os.getcwd()),
+        "yolo": yolo,
+        "timeout": timeout,
+        "width": width,
+        "planner": {"source": psrc, "rationale": rationale},
+        "jev": {"enabled": use_jev and jev.api_key() is not None, "model": jev.JEV_MODEL},
+        "agents": {k: a.binary for k, a in agents.items()},
+        "assignments": [a.to_dict() for a in assignments],
+    }
+
+
+def _spawn_detached(run_dir: pathlib.Path, *, use_tmux: bool, keep_tmux: bool) -> None:
+    argv = [sys.executable, str(HERE / "fanout.py"), "_execute", str(run_dir)]
+    if not use_tmux:
+        argv.append("--no-tmux")
+    if keep_tmux:
+        argv.append("--keep-tmux")
+    log = open(run_dir / "fanout.log", "ab")
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+
+
+def launch(plan: dict, *, preamble: str = "", use_tmux: bool = True, keep_tmux: bool = False,
+           detach: bool = False, log=eprint) -> dict:
+    run_dir = dispatch.new_run_dir()
+    dispatch.save_plan(run_dir, plan, preamble)
+    if detach:
+        _spawn_detached(run_dir, use_tmux=use_tmux, keep_tmux=keep_tmux)
+        return {"run_id": run_dir.name, "run_dir": str(run_dir), "state": "started",
+                "tmux": f"fanout_{run_dir.name[-6:]}" if use_tmux and dispatch.tmux_available() else None}
+    st = asyncio.run(dispatch.execute(run_dir, use_tmux=use_tmux, keep_tmux=keep_tmux, log=log))
+    st["run_dir"] = str(run_dir)
+    return st
+
+
+def results(run_id: Optional[str] = None, tail: Optional[int] = None) -> dict:
+    run_dir = dispatch.resolve_run(run_id)
+    return {"run_id": run_dir.name, "run_dir": str(run_dir), "status": dispatch.read_status(run_dir),
+            "outputs": dispatch.outputs_for(run_dir, tail)}
+
+
+def agents_report(host: Optional[str] = None) -> dict:
+    found = detect()
+    return {
+        "host": host or detect_host(),
+        "installed": {k: a.to_dict() for k, a in found.items()},
+        "supported": sorted(BUILTIN),
+    }
+
+
+def doctor_report() -> dict:
+    key = jev.api_key()
+    jev_state = "no key (heuristic routing)"
+    if key:
+        try:
+            jev_state = jev.ping(key)
+        except jev.JevError as e:
+            jev_state = f"error: {e} (heuristic routing)"
+    return {
+        "agents": agents_report(),
+        "jev": {"model": jev.JEV_MODEL, "state": jev_state},
+        "planner": {"openrouter_model": plannermod.PLANNER_MODEL, "key": bool(key)},
+        "boost": boostmod.status(),
+        "tmux": dispatch.tmux_available(),
+        "runs_dir": str(dispatch.RUNS_DIR),
+    }
+
+
+# ---------------------------------------------------------------------------
+# printing
+# ---------------------------------------------------------------------------
+
+
+def _boost_str(b: dict) -> str:
+    parts = []
+    if b.get("caveman"):
+        parts.append(f"caveman:{b['caveman']}")
+    if b.get("rtk"):
+        parts.append("rtk")
+    if b.get("headroom"):
+        parts.append("headroom")
+    return ",".join(parts) or "-"
+
+
+def print_plan(plan: dict, out=sys.stdout) -> None:
+    w, p = plan["width"], plan["planner"]
+    print(f"[fanout] host={plan.get('host') or '?'}  agents={','.join(plan['agents'])}  "
+          f"jev={'on' if plan['jev']['enabled'] else 'off'}", file=out, flush=True)
+    print(f"[fanout] width={w['n']} ({w['source']})  planner={p['source']}  {p['rationale']}", file=out)
+    for a in plan["assignments"]:
+        conf = f"{a['confidence']:.2f}" if a.get("confidence") else "--"
+        dep = f" after {','.join(map(str, a['depends_on']))}" if a.get("depends_on") else ""
+        print(f"  W{a['id']} wave{a['wave']} {a['agent']:<9} conf={conf} size={a['size']:<7} "
+              f"boost={_boost_str(a['boost'])}  [{a['source']}]{dep}  {a['title']}", file=out, flush=True)
+
+
+def print_results(st: dict, run_dir: pathlib.Path, tail: int = 1500) -> None:
+    outs = dispatch.outputs_for(run_dir, tail)
+    for k, v in sorted(st["workers"].items(), key=lambda kv: int(kv[0])):
+        print(f"\n===== W{k} {v['agent']} [{v['state']}] {v.get('title', '')} =====")
+        print(outs.get(f"W{k}", "").rstrip() or "(no output)")
+    print(f"\n[fanout] {st['state']}  run: {run_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -42,381 +195,240 @@ from workers import (
 # ---------------------------------------------------------------------------
 
 
+def _add_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--repo", default=None, help="pack repo/file contents into every prompt")
+    p.add_argument("--paste", action="store_true", help="read extra context from stdin")
+    p.add_argument("--no-tmux", action="store_true", help="run headless instead of tmux panes")
+    p.add_argument("--keep-tmux", action="store_true", help="leave the tmux session open")
+    p.add_argument("--timeout", type=int, default=None, help="per-worker timeout (default: by task size)")
+    p.add_argument("--dry-run", action="store_true", help="print the routed plan, don't run")
+    p.add_argument("--detach", action="store_true", help="start the run in the background and return")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--yolo", action="store_true", help="skip agent permission prompts")
+    p.add_argument("--cwd", default=None, help="working dir for the agents (default: .)")
+    p.add_argument("--no-jev", action="store_true", help="heuristic routing only")
+    p.add_argument("--no-caveman", action="store_true")
+    p.add_argument("--no-rtk", action="store_true")
+    p.add_argument("--no-headroom", action="store_true")
+
+
+def _add_routing(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--agents", default=None, help="comma list restricting which agents may be used")
+    p.add_argument("--pin", default=None, help="send every subtask to this agent")
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        prog="fanout",
-        description="Launch N parallel Claude sessions in tmux panes.",
-    )
+    ap = argparse.ArgumentParser(prog="fanout", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_claude = sub.add_parser(
-        "claude",
-        help='Launch N claude sessions: fanout claude N "prompt" [more prompts...]',
-    )
-    p_claude.add_argument("n", type=int, help="Number of panes (1-10).")
-    p_claude.add_argument(
-        "prompts",
-        nargs="+",
-        help='1 prompt (replicated N times) OR exactly N prompts (one per pane).',
-    )
-    _add_common(p_claude)
+    pp = sub.add_parser("plan", help="plan -> Jev routes subtasks to agents -> run")
+    pp.add_argument("task")
+    pp.add_argument("-n", dest="n_hint", type=int, default=None, help="force the number of subtasks")
+    pp.add_argument("--max", dest="max_n", type=int, default=6)
+    pp.add_argument("--planner", default="auto", help="auto | openrouter | naive | <agent name>")
+    _add_routing(pp)
+    _add_common(pp)
 
-    p_plan = sub.add_parser(
-        "plan",
-        help='Orchestrator-Claude decides N and the per-pane prompts, then launches them.',
-    )
-    p_plan.add_argument("task", help='Task description, in prose.')
-    p_plan.add_argument(
-        "-n",
-        dest="n_hint",
-        type=int,
-        default=None,
-        help="Hint to orchestrator on desired N (still its decision).",
-    )
-    _add_common(p_plan)
-    p_plan.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print the orchestrator's plan; do not launch panes.",
-    )
+    rp = sub.add_parser("run", help="route each given prompt to the best agent -> run")
+    rp.add_argument("prompts", nargs="+")
+    _add_routing(rp)
+    _add_common(rp)
 
+    for name in BUILTIN:
+        ag = sub.add_parser(name, help=f"N parallel {name} workers")
+        ag.add_argument("n", type=int)
+        ag.add_argument("prompts", nargs="+")
+        _add_common(ag)
+
+    a = sub.add_parser("agents", help="list installed agents + calling host")
+    a.add_argument("--json", action="store_true")
+    d = sub.add_parser("doctor", help="check agents, Jev, planner, boosts, tmux")
+    d.add_argument("--json", action="store_true")
+
+    b = sub.add_parser("boost", help="install/wire caveman, rtk, headroom into every detected agent")
+    b.add_argument("--only", default=None, help="comma list: caveman,rtk,headroom")
+    b.add_argument("--dry-run", action="store_true")
+    b.add_argument("--status", action="store_true", help="show status only")
+
+    for name in ("status", "logs"):
+        s = sub.add_parser(name, help=f"{name} of a run (default: latest)")
+        s.add_argument("run", nargs="?", default=None)
+        s.add_argument("--json", action="store_true")
+        s.add_argument("--tail", type=int, default=None)
+
+    sub.add_parser("exec", help="JSON request on stdin -> JSON result on stdout")
+    sub.add_parser("mcp", help="stdio MCP server")
+
+    i = sub.add_parser("install", help="register fanout MCP + skill in every detected client")
+    i.add_argument("--clients", default=None, help="comma list (default: all detected)")
+    i.add_argument("--dry-run", action="store_true")
+    i.add_argument("--no-boost", action="store_true", help="skip `fanout boost`")
+
+    x = sub.add_parser("_execute")
+    x.add_argument("run_dir")
+    x.add_argument("--no-tmux", action="store_true")
+    x.add_argument("--keep-tmux", action="store_true")
     return ap.parse_args(argv)
 
 
-def _add_common(p: argparse.ArgumentParser) -> None:
-    p.add_argument(
-        "--repo",
-        help='Path to a repo or directory; its contents are packaged as preamble in every prompt.',
+def _boost_flags(a: argparse.Namespace) -> Dict[str, bool]:
+    return {"caveman": not a.no_caveman, "rtk": not a.no_rtk, "headroom": not a.no_headroom}
+
+
+def _only(a: argparse.Namespace) -> Optional[List[str]]:
+    v = a.agents
+    return [s.strip() for s in v.split(",") if s.strip()] if v else None
+
+
+def _prompts_to_subtasks(prompts: List[str], n: Optional[int] = None) -> List[dict]:
+    if n is not None:
+        if len(prompts) == 1:
+            prompts = prompts * n
+        elif len(prompts) != n:
+            raise SystemExit(f"fanout: got {len(prompts)} prompts for N={n} (pass 1 prompt or exactly N)")
+    return [{"title": p[:60], "prompt": p, "depends_on": []} for p in prompts]
+
+
+def _run_cli(a: argparse.Namespace, plan: dict, preamble: str) -> int:
+    if a.json and a.dry_run:
+        print(json.dumps(plan, indent=2))
+        return 0
+    print_plan(plan, out=sys.stderr if a.json else sys.stdout)
+    if a.dry_run:
+        return 0
+    st = launch(plan, preamble=preamble, use_tmux=not a.no_tmux, keep_tmux=a.keep_tmux, detach=a.detach)
+    if a.json:
+        print(json.dumps(st if a.detach else results(st["run_id"]), indent=2))
+    elif a.detach:
+        print(f"[fanout] started {st['run_id']}  (fanout status {st['run_id']})")
+        if st.get("tmux"):
+            print(f"[fanout] attach: tmux attach -t {st['tmux']}")
+    else:
+        print_results(st, pathlib.Path(st["run_dir"]))
+    return 0 if st.get("state") in ("done", "started") else 1
+
+
+def cmd_exec() -> int:
+    req = json.loads(sys.stdin.read() or "{}")
+    print(json.dumps(handle_request(req), indent=2))
+    return 0
+
+
+def handle_request(req: dict) -> dict:
+    """One JSON entrypoint for `fanout exec` and the MCP server's fanout_run/fanout_plan."""
+    preamble = build_context_preamble(req.get("repo"), False, req.get("context") or "")
+    subtasks = req.get("subtasks")
+    if not subtasks and req.get("prompts"):
+        subtasks = _prompts_to_subtasks(req["prompts"])
+    if subtasks:
+        subtasks, _ = plannermod.normalize_tasks({"tasks": subtasks})
+    plan = make_plan(
+        req.get("task") or "\n".join(s["prompt"] for s in subtasks or []),
+        subtasks=subtasks,
+        n_hint=req.get("n"),
+        max_n=int(req.get("max_n") or 6),
+        only=req.get("agents"),
+        pin=req.get("pin"),
+        planner=req.get("planner") or "auto",
+        use_jev=not req.get("no_jev"),
+        boosts=req.get("boost"),
+        preamble=preamble,
+        host=req.get("host"),
+        cwd=req.get("cwd"),
+        yolo=bool(req.get("yolo")),
+        timeout=req.get("timeout"),
     )
-    p.add_argument(
-        "--paste",
-        action="store_true",
-        help="Read context from stdin and prepend to every prompt.",
-    )
-    p.add_argument(
-        "--no-tmux",
-        action="store_true",
-        help="Use asyncio.gather instead of tmux panes (single-terminal output).",
-    )
-    p.add_argument(
-        "--keep-tmux",
-        action="store_true",
-        help="Don't kill the tmux session after panes finish.",
-    )
-    p.add_argument(
-        "--timeout",
-        type=float,
-        default=600.0,
-        help="Per-pane timeout in seconds (default 600).",
-    )
+    if req.get("dry_run"):
+        return {"plan": plan}
+    wait = bool(req.get("wait"))
+    st = launch(plan, preamble=preamble, use_tmux=bool(req.get("tmux", not wait)), detach=not wait,
+                log=eprint)
+    if wait:
+        return {"plan": plan, **results(st["run_id"], req.get("tail"))}
+    return {"plan": plan, **st}
 
 
-# ---------------------------------------------------------------------------
-# Context: repo packaging + stdin paste
-# ---------------------------------------------------------------------------
+def main(argv: Optional[List[str]] = None) -> int:
+    a = parse_args(argv)
 
-
-# Files and directories we never include in a repo dump.
-_SKIP_DIRS = frozenset(
-    {
-        ".git", "node_modules", "dist", "build", "__pycache__",
-        ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache",
-        ".idea", ".vscode", ".next", ".cache", "target",
-    }
-)
-_SKIP_SUFFIXES = (
-    ".pyc", ".pyo", ".so", ".dylib", ".dll", ".class",
-    ".o", ".a", ".exe", ".bin",
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
-    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z",
-    ".mp3", ".mp4", ".mov", ".avi", ".wav",
-    ".woff", ".woff2", ".ttf", ".otf", ".eot",
-    ".DS_Store",
-)
-_MAX_FILE_BYTES = 100_000        # skip individual files bigger than this
-_MAX_TOTAL_BYTES = 400_000       # truncate repo dump at this many bytes
-
-
-def pack_repo(repo_path: str) -> str:
-    """Walk repo and produce a text dump suitable for pasting into a Claude prompt.
-
-    Output format:
-        ===== file: path/to/file.py =====
-        <content>
-        ===== file: path/to/other.md =====
-        <content>
-
-    Skips binaries, prune dirs, oversized files. Truncates at _MAX_TOTAL_BYTES.
-    """
-    root = pathlib.Path(os.path.expanduser(repo_path)).resolve()
-    if not root.exists():
-        raise FileNotFoundError(f"--repo path does not exist: {repo_path}")
-    if root.is_file():
-        return _read_one(root, label=str(root.name))
-
-    chunks: List[str] = []
-    total = 0
-    truncated = False
-    for dirpath, dirnames, filenames in os.walk(root):
-        # in-place prune
-        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS and not d.startswith("."))
-        for fname in sorted(filenames):
-            if fname.startswith("."):
-                continue
-            if any(fname.endswith(s) for s in _SKIP_SUFFIXES):
-                continue
-            fp = pathlib.Path(dirpath) / fname
-            try:
-                size = fp.stat().st_size
-            except OSError:
-                continue
-            if size > _MAX_FILE_BYTES:
-                continue
-            rel = str(fp.relative_to(root))
-            chunk = _read_one(fp, label=rel)
-            if total + len(chunk) > _MAX_TOTAL_BYTES:
-                truncated = True
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-        if truncated:
-            break
-    if truncated:
-        chunks.append("\n===== [TRUNCATED: repo dump hit byte budget] =====\n")
-    return "".join(chunks)
-
-
-def _read_one(fp: pathlib.Path, label: str) -> str:
-    try:
-        text = fp.read_text(errors="ignore")
-    except OSError:
-        return ""
-    return f"\n===== file: {label} =====\n{text}\n"
-
-
-def read_stdin_paste() -> str:
-    """Read all of stdin. Returns empty string if stdin is a tty."""
-    if sys.stdin.isatty():
-        return ""
-    return sys.stdin.read()
-
-
-def build_context_preamble(repo: Optional[str], paste: bool) -> str:
-    parts: List[str] = []
-    if repo:
-        parts.append(f"<repo path=\"{repo}\">\n{pack_repo(repo)}\n</repo>\n")
-    if paste:
-        pasted = read_stdin_paste()
-        if pasted.strip():
-            parts.append(f"<paste>\n{pasted}\n</paste>\n")
-    return "".join(parts)
-
-
-def wrap_with_context(prompt: str, preamble: str) -> str:
-    if not preamble:
-        return prompt
-    return preamble + "\n\n<task>\n" + prompt + "\n</task>\n"
-
-
-# ---------------------------------------------------------------------------
-# Subcommand: claude
-# ---------------------------------------------------------------------------
-
-
-def cmd_claude(args) -> int:
-    n = args.n
-    if n < 1 or n > 10:
-        print(f"[fanout] N must be 1-10 (got {n})", file=sys.stderr)
-        return 1
-    prompts = list(args.prompts)
-    if len(prompts) == 1:
-        prompts = prompts * n
-    elif len(prompts) != n:
-        print(
-            f"[fanout] got {len(prompts)} prompts but N={n}; "
-            f"either supply 1 prompt (replicated) or exactly N prompts.",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        preamble = build_context_preamble(args.repo, args.paste)
-    except FileNotFoundError as e:
-        print(f"[fanout] {e}", file=sys.stderr)
-        return 1
-    final_prompts = [wrap_with_context(p, preamble) for p in prompts]
-    return asyncio.run(_dispatch(final_prompts, args))
-
-
-# ---------------------------------------------------------------------------
-# Subcommand: plan
-# ---------------------------------------------------------------------------
-
-
-def cmd_plan(args) -> int:
-    try:
-        preamble = build_context_preamble(args.repo, args.paste)
-    except FileNotFoundError as e:
-        print(f"[fanout] {e}", file=sys.stderr)
-        return 1
-
-    orchestrator_input = json.dumps(
-        {
-            "task": args.task,
-            "context": preamble if preamble else None,
-            "n_hint": args.n_hint,
-        },
-        indent=2,
-    )
-    print("[fanout plan] asking orchestrator to decompose...", file=sys.stderr)
-    try:
-        raw = asyncio.run(
-            call_claude(orchestrator_input, system=ORCHESTRATOR_SYSTEM, timeout=args.timeout)
-        )
-    except (BackendError, BackendTimeout) as e:
-        print(f"[fanout plan] orchestrator failed: {e}", file=sys.stderr)
-        return 3
-    inner = parse_claude_envelope(raw)
-    try:
-        obj = _extract_json(inner)
-    except ValueError as e:
-        print(f"[fanout plan] orchestrator output unparseable: {e}", file=sys.stderr)
-        print(inner[:800], file=sys.stderr)
-        return 3
-
-    if not isinstance(obj, dict) or "n" not in obj or "tasks" not in obj:
-        print(f"[fanout plan] bad orchestrator shape: {obj!r}", file=sys.stderr)
-        return 3
-    n = int(obj["n"])
-    tasks = list(obj["tasks"])
-    rationale = obj.get("rationale", "(no rationale)")
-    if len(tasks) != n:
-        print(
-            f"[fanout plan] mismatch: orchestrator declared n={n} but produced {len(tasks)} tasks",
-            file=sys.stderr,
-        )
-        return 3
-
-    print(f"[fanout plan] N={n}  rationale: {rationale}", file=sys.stderr)
-    for i, t in enumerate(tasks, start=1):
-        excerpt = t[:120].replace("\n", " ")
-        print(f"  W{i}: {excerpt}{'...' if len(t) > 120 else ''}", file=sys.stderr)
-
-    if args.dry_run:
-        print(json.dumps(obj, indent=2))
+    if a.cmd == "agents":
+        rep = agents_report()
+        if a.json:
+            print(json.dumps(rep, indent=2))
+            return 0
+        print(f"host: {rep['host'] or 'unknown'}")
+        for k, v in rep["installed"].items():
+            print(f"  {k:<9} {v['binary']}\n            {v['strengths']}")
+        missing = [s for s in rep["supported"] if s not in rep["installed"]]
+        print(f"not installed: {', '.join(missing) or '-'}")
         return 0
 
-    final_prompts = [wrap_with_context(t, preamble) for t in tasks]
-    return asyncio.run(_dispatch(final_prompts, args))
-
-
-# ---------------------------------------------------------------------------
-# Dispatch
-# ---------------------------------------------------------------------------
-
-
-async def _dispatch(prompts: List[str], args) -> int:
-    use_tmux = (not getattr(args, "no_tmux", False)) and tmux_available()
-    print(f"[fanout] launching {len(prompts)} panes ({'tmux' if use_tmux else 'headless'})...", file=sys.stderr)
-
-    if use_tmux:
-        info = dispatch_tmux(prompts)
-        session = info["session"]
-        print(f"[fanout] tmux session: {session}", file=sys.stderr)
-        print(f"  attach: tmux attach -t {session}", file=sys.stderr)
-        print(f"  logs:   {info['run_dir']}/W*.out", file=sys.stderr)
-        results = await wait_for_done(info["pane_files"], timeout=getattr(args, "timeout", 600.0) * 2)
-        for r in results:
-            print(f"\n=== W{r['id']} ===\n{r['output']}")
-        if not getattr(args, "keep_tmux", False):
-            kill_tmux_session(session)
-            print(f"[fanout] killed tmux session {session}", file=sys.stderr)
-        else:
-            print(f"[fanout] keeping tmux session {session}", file=sys.stderr)
+    if a.cmd == "doctor":
+        rep = doctor_report()
+        if a.json:
+            print(json.dumps(rep, indent=2))
+            return 0
+        ag = rep["agents"]
+        print(f"host:     {ag['host'] or 'unknown'}")
+        print(f"agents:   {', '.join(ag['installed']) or 'NONE'}")
+        print(f"jev:      {rep['jev']['model']}: {rep['jev']['state']}")
+        print(f"planner:  openrouter={'yes' if rep['planner']['key'] else 'no key'} -> local agent -> naive")
+        for k, v in rep["boost"].items():
+            extra = f" proxy={'up' if v.get('proxy_running') else 'down'}" if k == "headroom" else ""
+            print(f"{k + ':':<10}{'installed' if v['installed'] else 'missing'}{extra}")
+        print(f"tmux:     {'yes' if rep['tmux'] else 'no (headless)'}")
         return 0
 
-    # Headless
-    coros = [call_claude(p, timeout=getattr(args, "timeout", 600.0)) for p in prompts]
-    outs = await asyncio.gather(*coros, return_exceptions=True)
-    failed = 0
-    for i, o in enumerate(outs, start=1):
-        if isinstance(o, Exception):
-            failed += 1
-            print(f"\n=== W{i} ===\n[ERROR] {type(o).__name__}: {o}")
+    if a.cmd == "boost":
+        if a.status:
+            print(json.dumps(boostmod.status(), indent=2))
+            return 0
+        only = [s.strip() for s in a.only.split(",")] if a.only else None
+        res = boostmod.enable(detect(), only=only, dry_run=a.dry_run)
+        return 0 if all(r.get("ok", True) for r in res) else 1
+
+    if a.cmd in ("status", "logs"):
+        r = results(a.run, a.tail if a.cmd == "logs" else 0)
+        if a.json:
+            print(json.dumps(r if a.cmd == "logs" else r["status"], indent=2))
+        elif a.cmd == "status":
+            st = r["status"]
+            print(f"{r['run_id']}  {st['state']}" + (f"  tmux={st['tmux']}" if st.get("tmux") else ""))
+            for k, v in sorted(st["workers"].items(), key=lambda kv: int(kv[0])):
+                print(f"  W{k} wave{v['wave']} {v['agent']:<9} {v['state']:<8} {v.get('title', '')}")
         else:
-            print(f"\n=== W{i} ===\n{o}")
-    return 0 if failed == 0 else 3
+            for k, v in r["outputs"].items():
+                print(f"===== {k} =====\n{v.rstrip()}\n")
+        return 0
 
+    if a.cmd == "exec":
+        return cmd_exec()
 
-# ---------------------------------------------------------------------------
-# JSON extractor (orchestrator output, tolerant of fences/preamble)
-# ---------------------------------------------------------------------------
+    if a.cmd == "mcp":
+        return mcp_server.serve()
 
+    if a.cmd == "install":
+        return install.run(clients=a.clients, dry_run=a.dry_run, boost=not a.no_boost)
 
-def _extract_json(raw: str):
-    s = (raw or "").strip()
-    if not s:
-        raise ValueError("empty orchestrator output")
-    try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        pass
-    for i, c in enumerate(s):
-        if c not in "{[":
-            continue
-        sub = _balanced(s, i)
-        if sub is None:
-            continue
-        try:
-            return json.loads(sub)
-        except json.JSONDecodeError:
-            continue
-    raise ValueError("no parseable JSON")
+    if a.cmd == "_execute":
+        run_dir = pathlib.Path(a.run_dir)
+        st = asyncio.run(dispatch.execute(run_dir, use_tmux=not a.no_tmux, keep_tmux=a.keep_tmux, log=eprint))
+        return 0 if st["state"] == "done" else 1
 
-
-def _balanced(s: str, start: int) -> Optional[str]:
-    o = s[start]
-    c = "}" if o == "{" else "]"
-    depth, in_str, esc = 0, False, False
-    for j in range(start, len(s)):
-        ch = s[j]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-        else:
-            if ch == '"':
-                in_str = True
-            elif ch == o:
-                depth += 1
-            elif ch == c:
-                depth -= 1
-                if depth == 0:
-                    return s[start : j + 1]
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Entry
-# ---------------------------------------------------------------------------
-
-
-HANDLERS = {
-    "claude": cmd_claude,
-    "plan": cmd_plan,
-}
-
-
-def main() -> int:
-    args = parse_args()
-    handler = HANDLERS[args.cmd]
-    try:
-        return handler(args)
-    except KeyboardInterrupt:
-        return 130
+    preamble = build_context_preamble(a.repo, a.paste)
+    common = dict(boosts=_boost_flags(a), use_jev=not a.no_jev, preamble=preamble, cwd=a.cwd,
+                  yolo=a.yolo, timeout=a.timeout)
+    if a.cmd == "plan":
+        plan = make_plan(a.task, n_hint=a.n_hint, max_n=a.max_n, only=_only(a), pin=a.pin,
+                         planner=a.planner, **common)
+    elif a.cmd == "run":
+        plan = make_plan("\n".join(a.prompts), subtasks=_prompts_to_subtasks(a.prompts),
+                         only=_only(a), pin=a.pin, **common)
+    else:
+        plan = make_plan(a.prompts[0] if len(a.prompts) == 1 else "\n".join(a.prompts),
+                         subtasks=_prompts_to_subtasks(a.prompts, a.n), pin=a.cmd, balance=False, **common)
+    return _run_cli(a, plan, preamble)
 
 
 if __name__ == "__main__":
